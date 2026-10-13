@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vizard-mcp"
+version = "1.0.0"
+description = "MCP server that lets AI assistants inspect and drive running WorldViz Vizard apps"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Zarrar" }]
+keywords = ["mcp", "vizard", "worldviz", "vr", "virtual-reality", "claude"]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
+dependencies = ["mcp>=2.3,<3", "pillow>=10"]
+
+[project.scripts]
+vizard-mcp = "vizard_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vizard_mcp"]
