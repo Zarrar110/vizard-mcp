@@ -10,7 +10,11 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-authors = [{ name = "Zarrar" }]
+authors = [{ name = "Zarrar Abbas", email = "zarrarabbas73@gmail.com" }]
+
+[project.urls]
+Homepage = "https://github.com/Zarrar110/vizard-mcp"
+Issues = "https://github.com/Zarrar110/vizard-mcp/issues"
 keywords = ["mcp", "vizard", "worldviz", "vr", "virtual-reality", "claude"]
 classifiers = [
     "Operating System :: Microsoft :: Windows",

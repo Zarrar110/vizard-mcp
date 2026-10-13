@@ -189,6 +189,11 @@ Screenshots, CSV files and recordings go to `%TEMP%\vizmcp` unless a path is giv
 .venv\Scripts\python tests\live_test.py        # launches examples/demo_scene.py and checks every tool and the demo's physics
 ```
 
+## Contact
+
+Built by Zarrar Abbas, who develops research and exhibition VR simulations for civil engineering in Vizard.
+Questions, ideas and collaboration: **zarrarabbas73@gmail.com**, or open an issue on this repository.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
