@@ -1153,7 +1153,7 @@ def make_report(sections: list[dict[str, Any]], path: str | None = None, title: 
 	out = os.path.abspath(path) if path else os.path.join(tempfile.gettempdir(), 'vizmcp',
 	                                                       'report_%s.html' % time.strftime('%Y%m%d_%H%M%S'))
 	os.makedirs(os.path.dirname(out), exist_ok=True)
-	with open(out, 'w', encoding='utf-8') as f:
+	with open(out, 'w', encoding='utf-8', newline='\n') as f:
 		f.write(doc)
 	summary = {'path': out, 'bytes': os.path.getsize(out), 'sections': len(sections), 'images': images,
 	           'validations': results}
