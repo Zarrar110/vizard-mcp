@@ -191,13 +191,26 @@ def test_restore_can_be_repeated(scene):
 def test_restore_reports_missing_nodes_and_still_restores_the_rest(scene):
 	scene.vm.cmd_snapshot_save({'name': 'a', 'nodes': ['ball', 'crane', scene.arm.id]})
 	disturb(scene)
-	scene.viz.nodes.remove(scene.arm)                           # the arm was deleted from the scene
-	scene.viz.nodes.remove(scene.crane)                         # the crane too, and the script no longer has "crane"
-	del scene.ns['crane']
+	for gone in (scene.arm, scene.crane):                       # deleted from the scene, as node.remove() does
+		scene.viz.nodes.remove(gone)
+		gone.valid = lambda: False
+	del scene.ns['crane']                                       # and the script no longer has "crane"
 	res = scene.vm.cmd_snapshot_restore({'name': 'a'})
 	assert res['restored'] == 1 and scene.ball.pos == [2.5, 1, 0]
 	by_ref = {m['ref']: m for m in res['missing']}
 	assert set(by_ref) == {'crane', scene.arm.id}
+	assert all('removed' in m['reason'] for m in by_ref.values())
+
+
+def test_restore_without_the_saved_objects_reports_lookup_errors(scene):
+	"""Without the saved objects (a snapshot file read by a later run), names and ids are looked up."""
+	scene.vm.cmd_snapshot_save({'name': 'a', 'nodes': ['ball', 'crane', scene.arm.id]})
+	scene.vm._State.snapshot_nodes.clear()
+	scene.viz.nodes.remove(scene.arm)
+	scene.viz.nodes.remove(scene.crane)
+	del scene.ns['crane']
+	res = scene.vm.cmd_snapshot_restore({'name': 'a'})
+	by_ref = {m['ref']: m for m in res['missing']}
 	assert 'NameError' in by_ref['crane']['reason'] and 'not a Vizard node' in by_ref[scene.arm.id]['reason']
 
 
@@ -426,3 +439,14 @@ def test_list_tool_asks_the_app_or_reads_a_file_without_it(app, tmp_path):
 		run(S.mcp.call_tool('snapshot_list', {'path': str(f)}))
 	with pytest.raises(ToolError, match='Cannot read'):
 		run(S.mcp.call_tool('snapshot_list', {'path': str(tmp_path / 'absent.json')}))
+
+
+def test_a_removed_node_whose_id_still_resolves_is_reported_missing(scene):
+	"""Vizard returns an object for a removed node's id; restoring onto it would do nothing."""
+	scene.vm.cmd_snapshot_save({'name': 'a', 'nodes': ['ball', 'crane']})
+	disturb(scene)
+	scene.crane.valid = lambda: False                           # removed, though its id still resolves
+	del scene.ns['crane']
+	res = scene.vm.cmd_snapshot_restore({'name': 'a'})
+	assert res['restored'] == 1 and [m['ref'] for m in res['missing']] == ['crane']
+	assert 'removed' in res['missing'][0]['reason']

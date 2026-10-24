@@ -308,6 +308,7 @@ class _State(object):
 	recording = None
 	vr = None
 	snapshots = collections.OrderedDict()
+	snapshot_nodes = {}     # snapshot name -> {node id: the node object saved}; never written to a file
 
 
 def _new_path(prefix, ext):
@@ -2525,6 +2526,7 @@ def _snapshot_entries(p):
 	limit = max(1, int(p.get('max_nodes', 2000)))
 	labels = _labels()
 	entries = collections.OrderedDict()
+	objects = {}
 	truncated = False
 
 	def add(node, ref):
@@ -2538,6 +2540,7 @@ def _snapshot_entries(p):
 		kind = 'id' if _is_id_ref(ref) else 'expr'
 		entries[node.id] = dict({'ref': int(ref) if kind == 'id' else ref, 'kind': kind, 'id': node.id,
 		                         'names': list(names), 'type': type(node).__name__}, **_node_state(node))
+		objects[node.id] = node
 
 	try:
 		for ref in p.get('nodes') or []:
@@ -2554,7 +2557,7 @@ def _snapshot_entries(p):
 			truncated = truncated or cut
 	except _Full:
 		truncated = True
-	return list(entries.values()), truncated
+	return list(entries.values()), truncated, objects
 
 
 class _Full(Exception):
@@ -2609,7 +2612,7 @@ def cmd_snapshot_save(p):
 		raise ValueError('give nodes, named, root or state: nothing to record')
 	if p.get('restore_code') and not state_expr:
 		raise ValueError('restore_code needs state (an expression that returns the value to keep)')
-	nodes, truncated = _snapshot_entries(p)
+	nodes, truncated, objects = _snapshot_entries(p)
 	snap = {'name': name, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'), 'pid': os.getpid(),
 	        'vizard_version': viz.version(), 'script': getattr(sys.modules['__main__'], '__file__', None),
 	        'truncated': truncated, 'nodes': nodes}
@@ -2630,6 +2633,7 @@ def cmd_snapshot_save(p):
 	if p.get('path'):
 		snap['file'] = _snapshot_write(snap, os.path.abspath(p['path']))
 	_State.snapshots[name] = snap
+	_State.snapshot_nodes[name] = objects
 	res = _snapshot_summary(snap)
 	if state_expr and not snap['state']['json_exact']:
 		res['note'] = ('the state value is not JSON data: it is kept in the app for snapshot_restore, but a '
@@ -2637,19 +2641,44 @@ def cmd_snapshot_save(p):
 	return res
 
 
-def _snapshot_resolve(entry, same_app):
-	"""(node, None) or (None, reason) for one recorded node."""
+def _snapshot_resolve(entry, same_app, objects=None):
+	"""(node, None) or (None, reason) for one recorded node.
+
+	In the app that saved it, the node object itself is used: Vizard reuses a removed node's
+	id for the next new node, and _GetObject of a removed id returns a fresh object that
+	reports valid(), so neither the id nor the expression's old value is a safe way back."""
+	if same_app and objects and entry.get('id') in objects:
+		node = objects[entry['id']]
+		try:
+			if node.valid():
+				return node, None
+		except Exception:
+			return node, None
+		return None, 'node %s was removed' % entry['ref']
+	def alive(node):
+		# Vizard hands back an object for the id of a removed node too; setting it does nothing.
+		try:
+			return bool(node.valid())
+		except Exception:
+			return True
+
 	reason = None
 	if entry['kind'] == 'expr':
 		try:
-			return _resolve_node(entry['ref']), None
+			node = _resolve_node(entry['ref'])
+			if alive(node):
+				return node, None
+			reason = 'node %s was removed' % entry['ref']
 		except Exception as e:
 			reason = '%s: %s' % (type(e).__name__, e)
 	elif not same_app:
 		return None, 'node id %s is from another Vizard session' % entry['ref']
 	if same_app and entry.get('id') is not None:
 		try:
-			return _resolve_node(entry['id']), None
+			node = _resolve_node(entry['id'])
+			if alive(node):
+				return node, None
+			reason = reason or 'node %s was removed' % entry['id']
 		except Exception as e:
 			reason = reason or '%s: %s' % (type(e).__name__, e)
 	return None, reason
@@ -2702,7 +2731,7 @@ def cmd_snapshot_restore(p):
 					ns.pop('_state', None)
 
 	for e in snap['nodes']:
-		node, reason = _snapshot_resolve(e, same_app)
+		node, reason = _snapshot_resolve(e, same_app, _State.snapshot_nodes.get(name))
 		if node is None:
 			res['missing'].append({'ref': e['ref'], 'names': e.get('names', []), 'reason': reason})
 			continue
