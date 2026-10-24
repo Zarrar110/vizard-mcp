@@ -182,11 +182,22 @@ Screenshots, CSV files and recordings go to `%TEMP%\vizmcp` unless a path is giv
 - `click` needs the Vizard window visible on screen. A mouse-look navigator may also react to the click.
 - Scripts that open a dialog at startup (e.g. hardware selection) must be told to skip it through `env`, or `launch_app` waits until its timeout.
 
-## Tests
+## Running the tests
+
+The test suite is offline: it needs neither Vizard nor Windows (CI runs it on Linux and Windows).
 
 ```bash
-.venv\Scripts\python tests\test_mcp_stdio.py   # MCP handshake and tool list, no Vizard needed
-.venv\Scripts\python tests\live_test.py        # launches examples/demo_scene.py and checks every tool and the demo's physics
+pip install -e ".[test]"
+pytest
+```
+
+It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 28 tools, error handling, stdio handshake).
+
+Two scripts need more and are not part of the default run:
+
+```bash
+python tests/test_mcp_stdio.py   # prints the tool list and status over a real stdio session
+set VIZMCP_LIVE=1 && python tests/live_test.py   # launches examples/demo_scene.py in a real Vizard and checks every tool and the demo's physics
 ```
 
 ## Contact
