@@ -37,8 +37,11 @@ Seeing: screenshot (annotate=true labels named nodes), multi_view (orbit a node 
 several angles without disturbing the user's view), filmstrip (frames over time), pick
 (what is at a point of a screenshot).
 Measuring: watch_start / watch_read / watch_plot record any expressions every frame
-(e.g. a deflection or a velocity) so results can be checked against theory;
-wait_until runs the app until a condition holds; profile finds slow Python per frame.
+(e.g. a deflection or a velocity) so results can be checked against theory, and
+watch_export writes them to CSV or JSON for reports;
+wait_until runs the app until a condition holds; profile finds slow Python per frame;
+scene_stats counts nodes, textures, triangles and lights to explain a slow scene.
+Regression checks: screenshot_diff compares the window with a reference PNG.
 Screen coordinates are 0..1 from the top-left corner of the screenshot.
 
 Vizard is Y-up and left-handed; euler is [yaw, pitch, roll] in degrees.
@@ -51,6 +54,7 @@ class VizardToolError(ToolError, RuntimeError):
 	the type callers of the tool functions have always seen."""
 
 
+# Tools that return [Image, text] must opt out of structured output: the SDK cannot serialise Image.
 mcp = MCPServer('vizard-mcp', instructions=INSTRUCTIONS)
 client = VizardClient()
 _launched = {'proc': None, 'log': None}
@@ -318,7 +322,7 @@ def vizard_api(query: str = '', name: str | None = None, limit: int = 30) -> str
 # Seeing
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def screenshot(max_size: int = 1024, annotate: bool = False, label_limit: int = 25,
                save_to: str | None = None) -> list[Any]:
 	"""Capture the Vizard window as it is rendered now and return the image.
@@ -339,7 +343,60 @@ def screenshot(max_size: int = 1024, annotate: bool = False, label_limit: int = 
 	return [_jpeg(imaging.fit(im, max_size)), text]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
+def screenshot_diff(reference: str, threshold_pct: float | None = None, pixel_tolerance: int = 8,
+                    save_diff_to: str | None = None, update_reference: bool = False,
+                    max_size: int = 1024) -> list[Any]:
+	"""Visual regression check: capture the Vizard window and compare it with a reference
+	PNG. Returns a diff image (reference dimmed, changed pixels in red, changed areas boxed)
+	and the percentage of pixels that differ.
+
+	reference: path of the reference PNG (it must be the same size as the window).
+	threshold_pct: if given, the result says pass/fail: pass when the differing pixels are
+	               at most this percentage of the image.
+	pixel_tolerance: a pixel counts as different when any colour channel differs by more
+	                 than this (0-255); absorbs anti-aliasing noise.
+	save_diff_to: optional .png path for the full-size diff image.
+	update_reference: write the current capture to `reference` (creating or replacing the
+	                  baseline) instead of comparing.
+	"""
+	if not 0 <= pixel_tolerance <= 255:
+		raise VizardToolError('pixel_tolerance must be 0..255.')
+	if threshold_pct is not None and not 0 <= threshold_pct <= 100:
+		raise VizardToolError('threshold_pct must be 0..100.')
+	reference = os.path.abspath(reference)
+	res = _call('screenshot', wait_s=30)
+	current = imaging.load(res['path'])
+	if update_reference:
+		os.makedirs(os.path.dirname(reference), exist_ok=True)
+		current.save(reference, 'PNG')
+		return [_jpeg(imaging.fit(current, max_size)),
+		        _dump({'reference_written': reference, 'size': list(current.size)})]
+	if not os.path.isfile(reference):
+		raise VizardToolError('No reference image at %s. Pass update_reference=true to create it '
+		                      'from the current window.' % reference)
+	try:
+		ref = imaging.load(reference)
+	except OSError as e:
+		raise VizardToolError('Cannot read the reference image %s: %s' % (reference, e))
+	result = imaging.diff(current, ref, pixel_tolerance)
+	diff_im = result.pop('image')
+	out = dict(result, reference=reference, capture=res['path'])
+	if threshold_pct is not None:
+		out['threshold_pct'] = threshold_pct
+		out['passed'] = (not out['size_mismatch']) and out['diff_pct'] <= threshold_pct
+	if diff_im is not None and save_diff_to:
+		path = os.path.abspath(save_diff_to)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		diff_im.save(path, 'PNG')
+		out['diff_image'] = path
+	if diff_im is None:
+		diff_im = current
+		out['note'] = 'sizes differ: the capture is returned instead of a diff image'
+	return [_jpeg(imaging.fit(diff_im, max_size)), _dump(out)]
+
+
+@mcp.tool(structured_output=False)
 def multi_view(orbit: str | None = None, target: list[float] | None = None, radius: float = 5.0,
                count: int = 4, elevation_deg: float = 25.0, distance: float | None = None,
                start_yaw_deg: float = 45.0, views: list[dict[str, Any]] | None = None,
@@ -368,7 +425,7 @@ def multi_view(orbit: str | None = None, target: list[float] | None = None, radi
 	return [_jpeg(sheet), text]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def filmstrip(count: int = 6, interval_s: float = 0.5, max_size: int = 1400) -> list[Any]:
 	"""See motion: capture `count` frames `interval_s` apart (the app keeps running) and
 	return them as one grid image, captioned with the time of each frame."""
@@ -435,10 +492,11 @@ def send_key(key: str, hold_frames: int = 1) -> str:
 
 @mcp.tool()
 def click(x: float, y: float, button: str = 'left', double: bool = False) -> str:
-	"""Click in the Vizard window with the real mouse at (x, y), 0..1 from the top-left of
-	a screenshot; for on-screen GUI (buttons, sliders, menus) and mouse handlers. The
-	window is brought to the front, the click is refused if another window covers that
-	point, and the cursor is put back afterwards. Note that a mouse-look navigator may
+	"""Click in the Vizard window with the real mouse at (x, y), 0..1 of the window's client
+	area from the top-left (the same coordinates as a screenshot); for on-screen GUI
+	(buttons, sliders, menus) and mouse handlers. The window is brought to the front if it
+	is not there already (and restored if minimised), the click is refused if another
+	window covers that point, and the cursor is put back afterwards. Note that a mouse-look navigator may
 	also react to the click."""
 	return _dump(_call('click', wait_s=20, x=x, y=y, button=button, double=double))
 
@@ -482,7 +540,7 @@ def watch_read(name: str, max_points: int = 100, stop: bool = False, delete: boo
 	                   csv_path=os.path.abspath(csv_path) if csv_path else None))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def watch_plot(name: str, columns: list[str] | None = None, title: str | None = None) -> list[Any]:
 	"""Plot a watch's columns against app time as a line chart image (max marked).
 	columns: which ones (default all). Columns with very different scales are clearer
@@ -499,6 +557,34 @@ def watch_plot(name: str, columns: list[str] | None = None, title: str | None = 
 	series = [(c, [r[cols.index(c)] for r in res['samples']]) for c in want]
 	im = imaging.line_chart(title or 'watch "%s"' % name, t, series)
 	return [_jpeg(im), 'csv: %s; status: %s' % (res.get('csv'), res['status'])]
+
+
+@mcp.tool()
+def watch_export(name: str, path: str, format: str | None = None,
+                 columns: list[str] | None = None) -> str:
+	"""Write a recorded watch (every sample, not a downsample) to a file for validation
+	reports.
+
+	path: output file; its extension (.csv or .json) picks the format unless `format` is given.
+	columns: which columns to write, in that order (default all: "t" is app time in seconds,
+	         "frame", then the watched values; vectors are split into .x/.y/.z columns).
+	CSV has a header row. JSON is {"watch", "expressions", "stop_reason", "samples",
+	"columns", "rows"} with rows as lists in column order."""
+	if format is not None and format.lower() not in ('csv', 'json'):
+		raise VizardToolError('format must be "csv" or "json".')
+	return _dump(_call('watch_export', name=name, path=os.path.abspath(path),
+	                   format=format.lower() if format else None, columns=columns))
+
+
+@mcp.tool()
+def scene_stats(top: int = 10) -> str:
+	"""Counts that explain why a scene is slow, e.g. on an integrated GPU: nodes, visible
+	nodes, node types, textures, approximate triangles (all and visible), lights and the
+	`top` heaviest nodes with their script names. A figure the running Vizard cannot
+	provide is null, with a note saying so; heavy nodes are then ranked by sub-node count."""
+	if top < 0:
+		raise VizardToolError('top must be 0 or more.')
+	return _dump(_call('scene_stats', top=top))
 
 
 @mcp.tool()

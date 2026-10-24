@@ -114,6 +114,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | Tool | What it does |
 |---|---|
 | `screenshot` | The window as rendered now; `annotate=true` tags each named node on screen with its script name |
+| `screenshot_diff` | Compare the window with a reference PNG for visual regression: percentage of pixels that differ, a diff image (changes in red, changed areas boxed), and pass/fail against an optional `threshold_pct`. `pixel_tolerance` absorbs anti-aliasing noise; `update_reference=true` writes the current window as the new baseline. The reference must be the same size as the window |
 | `multi_view` | Orbit a node (or point) from N angles, or a list of views, in one grid image; the user's view is restored exactly |
 | `filmstrip` | N frames over time in one grid, to see motion |
 | `record_video` | AVI recording with Vizard's built-in recorder, for people to watch (uncompressed: about 25 MB per second at 800x600) |
@@ -126,7 +127,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | Tool | What it does |
 |---|---|
 | `send_key` | KEYDOWN/KEYUP events, and `viz.key.isDown()` held true for N frames |
-| `click` | Real mouse click in the Vizard window (GUI buttons, sliders, mouse handlers); refuses if another window covers the point; cursor restored |
+| `click` | Real mouse click in the Vizard window (GUI buttons, sliders, mouse handlers). Coordinates are 0..1 of the window's client area; the window is brought to the foreground (and restored if minimised) when it is not already there; refuses if another window covers the point; cursor restored |
 | `wait` | Let N frames and/or seconds pass |
 | `wait_until` | Run until a Python condition is true in the app (`"truck.x > 30"`) |
 
@@ -137,6 +138,8 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `watch_start` | Record any expressions every N frames with app time; vectors split into `.x/.y/.z`; stops at `until`, a sample limit or an error |
 | `watch_read` | Per column first/last/min/max (with times)/mean, evenly spaced samples, full CSV file |
 | `watch_plot` | Line chart image of watched columns against time, max marked |
+| `watch_export` | Write every sample of a watch to a `.csv` or `.json` file (`path`; optional `columns` to pick and order them) for validation reports. JSON is `{watch, expressions, stop_reason, samples, columns, rows}` |
+| `scene_stats` | Why is a scene slow? Counts of nodes, visible nodes, node types, textures, approximate triangles (all and visible), lights, and the `top` heaviest nodes with their script names. A figure the running Vizard cannot provide is `null` with a note, and heavy nodes are then ranked by sub-node count |
 | `profile` | cProfile of all main-thread Python for N frames: frame time mean/p95/max, FPS, Python ms per frame, top functions |
 | `call_command` | Call a command the app registered itself |
 
@@ -191,7 +194,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 28 tools, error handling, stdio handshake).
+It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 31 tools, error handling, stdio handshake), plus vizmcp's new commands run against a stand-in for Vizard's `viz` module.
 
 Two scripts need more and are not part of the default run:
 

@@ -3,7 +3,7 @@
 import io
 import math
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 PALETTE = [(31, 119, 180), (214, 39, 40), (44, 160, 44), (255, 127, 14), (148, 103, 189),
            (140, 86, 75), (227, 119, 194), (23, 190, 207), (188, 189, 34), (127, 127, 127)]
@@ -144,3 +144,35 @@ def line_chart(title, x, series, x_label='time (s)', size=(1100, 620)):
 		if lx > W - 300:
 			lx, ly = left + 10, ly + 22
 	return im
+
+
+def diff(current, reference, tolerance=8, tile=32):
+	"""Compare two RGB images. A pixel differs when any channel differs by more than
+	`tolerance`. Returns diff_pct, changed pixel count, the bounding box of the changes,
+	the changed tiles and a diff image (None if the sizes differ)."""
+	if current.size != reference.size:
+		return {'image': None, 'size_mismatch': True, 'capture_size': list(current.size),
+		        'reference_size': list(reference.size), 'diff_pct': 100.0, 'changed_pixels': None,
+		        'total_pixels': None, 'bbox': None, 'changed_tiles': None}
+	r, g, b = ImageChops.difference(current, reference).split()
+	worst = ImageChops.lighter(ImageChops.lighter(r, g), b)
+	mask = worst.point(lambda v: 255 if v > tolerance else 0)
+	w, h = current.size
+	changed = mask.histogram()[255]
+	total = w * h
+	bbox = mask.getbbox()
+	# Faded reference with the changed pixels in red, and a box round each tile that changed.
+	img = Image.blend(reference, Image.new('RGB', (w, h), (255, 255, 255)), 0.6)
+	img.paste(Image.new('RGB', (w, h), (255, 0, 0)), mask=mask)
+	draw = ImageDraw.Draw(img)
+	tiles = 0
+	if changed:
+		for ty in range(0, h, tile):
+			for tx in range(0, w, tile):
+				if mask.crop((tx, ty, min(tx + tile, w), min(ty + tile, h))).getbbox():
+					tiles += 1
+					draw.rectangle([tx, ty, min(tx + tile, w) - 1, min(ty + tile, h) - 1], outline=(200, 0, 0))
+		draw.rectangle([bbox[0], bbox[1], bbox[2] - 1, bbox[3] - 1], outline=(255, 0, 255), width=2)
+	return {'image': img, 'size_mismatch': False, 'diff_pct': round(100.0 * changed / total, 4),
+	        'changed_pixels': changed, 'total_pixels': total,
+	        'bbox': list(bbox) if bbox else None, 'changed_tiles': tiles}
