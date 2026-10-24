@@ -343,7 +343,8 @@ def test_doctor_remote_target_down_or_wrong_token_fails(home, monkeypatch):
 		srv.close()
 
 
-def test_doctor_local_target_text_is_unchanged(home):
+def test_doctor_local_target_text_is_unchanged(home, monkeypatch):
+	monkeypatch.setenv('VIZMCP_PORT', str(free_port()))      # 9877 may be taken on the dev machine
 	c = doctor.check_port()
 	assert c.status == 'PASS' and 'is free' in c.detail
 
