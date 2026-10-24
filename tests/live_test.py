@@ -41,8 +41,8 @@ def info(name, detail=''):
 def button_center():
 	"""Where the demo's Reset button is: centre as 0..1 from the top-left of the window,
 	asked of the app itself (Vizard's 2D coordinates have their origin bottom-left)."""
-	rc = j(S.run_code('r = reset_button.getRect(viz.WINDOW_NORMALIZED)\n'
-	                  '[r[0] + r[2] / 2.0, 1.0 - (r[1] + r[3] / 2.0)]'))
+	rc = j(S.run_code('c = reset_button.getBoundingBox().center\n'
+	                  '[c[0], 1.0 - c[1]]'))
 	if rc.get('error'):
 		return None, rc['error'].strip().splitlines()[-1]
 	return json.loads(rc['value'].replace("'", '"')), None
@@ -61,9 +61,9 @@ check('vizard_api search', 'viz.VizNode.getBoundingBox(self, mode=ABS_PARENT' in
 api = S.vizard_api(name='vizact.onupdate')
 check('vizard_api lookup', "Call 'func' every update frame" in api)
 
-info = j(S.launch_app(DEMO, restart=True))
-check('launch', info.get('frame', 0) > 0, 'startup %ss, vizard %s, vizmcp %s'
-      % (info.get('startup_s'), info.get('vizard_version'), info.get('vizmcp_version')))
+launched = j(S.launch_app(DEMO, restart=True))
+check('launch', launched.get('frame', 0) > 0, 'startup %ss, vizard %s, vizmcp %s'
+      % (launched.get('startup_s'), launched.get('vizard_version'), launched.get('vizmcp_version')))
 try:
 	# --- inspection --------------------------------------------------------
 	st = j(S.vizard_status())
@@ -167,7 +167,7 @@ try:
 		size = j(S.vizard_status())['window_size']
 		center, why = button_center()
 		if center is None:
-			# getRect is not available on this Vizard: sweep the top-left of the window instead.
+			# the bounding box is not available: sweep the top-left of the window instead.
 			info('button rect unavailable, scanning for the button', why)
 			targets = [[fx, fy] for fy in (0.04, 0.08, 0.12, 0.16) for fx in (0.04, 0.08, 0.12, 0.16, 0.2)]
 		else:
@@ -242,6 +242,8 @@ try:
 	S.set_node('label', visible=True)
 	info('scene_stats triangles/textures/lights', {k: st1[k] for k in ('triangles', 'triangles_visible', 'textures', 'lights', 'ranked_by')})
 	info('scene_stats notes', st1['notes'])
+	check('scene_stats counts triangles via getStats', (st1['triangles'] or 0) > 0 and st1['ranked_by'] == 'triangles'
+	      and 0 < st1['triangles_visible'] <= st1['triangles'], st1['triangles'])
 	# Triangle, texture and light accessors are probed by name; list what this Vizard really has.
 	for q in ('triangle', 'getTexture', 'light'):
 		info('vizard_api %r' % q, S.vizard_api(q, limit=8).replace('\n', ' | '))

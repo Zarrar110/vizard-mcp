@@ -1264,9 +1264,52 @@ def _try_accessors(obj, names):
 	return None, None
 
 
+def _stats(obj):
+	"""Vizard 8's NodeStats (vertexCount, primitiveCount, drawableCount, textureCount,
+	textureBytes, ...) of a node or scene, or None where getStats is missing or fails."""
+	fn = getattr(obj, 'getStats', None)
+	if fn is None:
+		return None
+	try:
+		return fn()
+	except Exception:
+		return None
+
+
+def _hidden_roots(costs):
+	"""Hidden nodes with no hidden ancestor, so subtracting their subtrees never double counts.
+	None when parents cannot be read."""
+	hidden = set(c['node'].id for c in costs if not c['visible'])
+	roots = []
+	for c in costs:
+		if c['visible']:
+			continue
+		try:
+			stack, seen, covered = list(c['node'].getParents()), set(), False
+			while stack:
+				par = stack.pop()
+				if par.id in seen:
+					continue
+				seen.add(par.id)
+				if par.id in hidden:
+					covered = True
+					break
+				stack.extend(par.getParents())
+		except Exception:
+			return None
+		if not covered:
+			roots.append(c)
+	return roots
+
+
 def _node_cost(node):
-	"""Per-node numbers for scene_stats: dict(triangles, subnodes, texture) with None where unknown."""
-	tris, tri_src = _try_accessors(node, _TRIANGLE_ACCESSORS)
+	"""Per-node numbers for scene_stats: dict(triangles, subnodes, texture) with None where unknown.
+	getStats counts the node's whole subtree; the older accessors are tried where it is missing."""
+	st = _stats(node)
+	if st is not None:
+		tris, tri_src = st.primitiveCount, 'getStats'
+	else:
+		tris, tri_src = _try_accessors(node, _TRIANGLE_ACCESSORS)
 	try:
 		subnodes = int(node.getNodeCount())
 	except Exception:
@@ -1308,16 +1351,31 @@ def cmd_scene_stats(p):
 			tri_sources.add(c['sources']['triangles'])
 
 	have_tris = any(c['triangles'] is not None for c in costs)
-	tri_all = sum(c['triangles'] or 0 for c in costs) if have_tris else None
-	tri_visible = sum(c['triangles'] or 0 for c in costs if c['visible']) if have_tris else None
-	# A node's triangles may already include its children's; the totals then double count.
 	notes = []
-	if not have_tris:
-		notes.append('no triangle accessor worked on this Vizard (tried %s); heavy nodes are ranked by '
-		             'sub-node count' % ', '.join(_TRIANGLE_ACCESSORS))
+	scene = _stats(getattr(viz, 'MainScene', None))
+	extra = {}
+	if scene is not None:
+		# Exact totals from the scene graph; a node's own figure covers its whole subtree.
+		tri_all = int(scene.primitiveCount)
+		roots = _hidden_roots(costs)
+		tri_visible = None if roots is None else tri_all - sum(c['triangles'] or 0 for c in roots)
+		extra = {'vertices': int(scene.vertexCount), 'drawables': int(scene.drawableCount),
+		         'texture_bytes': int(scene.textureBytes)}
+		notes.append('triangles are primitives from viz.MainScene.getStats(); per-node figures include the subtree')
 	else:
-		notes.append('triangles are approximate: group nodes may already include their children')
-	tex_total = _count_list(_TEXTURE_LIST)
+		tri_all = sum(c['triangles'] or 0 for c in costs) if have_tris else None
+		tri_visible = sum(c['triangles'] or 0 for c in costs if c['visible']) if have_tris else None
+		# A node's triangles may already include its children's; the totals then double count.
+		if not have_tris:
+			notes.append('no triangle accessor worked on this Vizard (tried getStats, %s); heavy nodes are '
+			             'ranked by sub-node count' % ', '.join(_TRIANGLE_ACCESSORS))
+		else:
+			notes.append('triangles are approximate: group nodes may already include their children')
+	tex_total, tex_src = _count_list(_TEXTURE_LIST), _TEXTURE_LIST
+	if tex_total is None and scene is not None:
+		tex_total, tex_src = int(scene.textureCount), 'getStats'
+	if tex_total is None:
+		tex_src = 'node textures' if textures else None
 	lights = _count_list(_LIGHT_LIST)
 	lights_by_type = sum(v for k, v in by_type.items() if 'light' in k.lower())
 	if lights is None:
@@ -1333,7 +1391,7 @@ def cmd_scene_stats(p):
 		'visible_nodes': visible,
 		'by_type': dict(by_type.most_common()),
 		'textures': tex_total if tex_total is not None else (len(textures) if textures else None),
-		'textures_source': _TEXTURE_LIST if tex_total is not None else ('node textures' if textures else None),
+		'textures_source': tex_src,
 		'triangles': tri_all,
 		'triangles_visible': tri_visible,
 		'lights': lights,
@@ -1342,6 +1400,7 @@ def cmd_scene_stats(p):
 		               'names': labels.get(c['node'].id, []), 'visible': c['visible'],
 		               'triangles': c['triangles'], 'subnodes': c['subnodes']} for c in heavy],
 		'notes': notes,
+		**extra,
 	}
 
 

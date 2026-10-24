@@ -176,6 +176,24 @@ def test_scene_stats_counts_distinct_node_textures(vm):
 	assert vm.cmd_scene_stats({})['textures'] == 2
 
 
+def test_scene_stats_uses_vizard8_getstats(vm):
+	def stats(prims, verts=0, tex=0, tex_bytes=0, drawables=1):
+		return lambda: types.SimpleNamespace(primitiveCount=prims, vertexCount=verts, drawableCount=drawables,
+		                                     textureCount=tex, textureBytes=tex_bytes)
+	group = FakeNode(subnodes=3, getStats=stats(900), getParents=lambda: [])
+	child = FakeNode(visible=False, getStats=stats(600), getParents=lambda: [group])
+	grandchild = FakeNode(visible=False, getStats=stats(100), getParents=lambda: [child])
+	other = FakeNode(getStats=stats(50), getParents=lambda: [])
+	vm.viz_stub.nodes = [group, child, grandchild, other]
+	vm.viz_stub.MainScene = types.SimpleNamespace(getStats=stats(950, verts=4000, tex=2, tex_bytes=1024, drawables=4))
+	res = vm.cmd_scene_stats({'top': 2})
+	assert res['triangles'] == 950 and res['vertices'] == 4000 and res['drawables'] == 4
+	assert res['triangles_visible'] == 350                     # the hidden child's subtree once, not twice
+	assert res['textures'] == 2 and res['textures_source'] == 'getStats' and res['texture_bytes'] == 1024
+	assert res['ranked_by'] == 'triangles' and [n['triangles'] for n in res['top_nodes']] == [900, 600]
+	json.dumps(res)
+
+
 def test_scene_stats_survives_failing_accessors(vm):
 	def boom():
 		raise RuntimeError('no')
