@@ -41,6 +41,7 @@ import operator
 import os
 import pstats
 import queue
+import re
 import socket
 import sys
 import tempfile
@@ -1590,7 +1591,14 @@ _BUTTON_METHODS = ('isButtonDown', 'isButtonUp', 'getButtonState')
 
 
 def _is_hand(n, side):
-	return side in n and any(k in n for k in ('hand', 'wrist', 'controller', 'touch', 'wand')) or n in (side, side[0])
+	"""left/right hand names in the usual spellings: left_hand, r_hand_tracker, rhand, R_Controller."""
+	if n in (side, side[0]):
+		return True
+	parts = [t for t in re.split(r'[^a-z0-9]+', n) if t]
+	handish = ('hand', 'wrist', 'controller', 'touch', 'wand')
+	if any(t.startswith(side[0]) and t[1:] in handish for t in parts):    # rhand, lcontroller
+		return True
+	return (side in n or side[0] in parts) and any(k in n for k in handish)
 
 
 _VR_ALIASES = {
@@ -1639,6 +1647,9 @@ class _VrObject(object):
 		self.key, self.obj, self.saved = key, obj, {}
 		self.pose = None
 		self.down = {}      # token -> set of equivalent tokens (its name and mapped index)
+		self.wrapper = None     # the vizconnect wrapper whose raw object was swapped
+		self.orig_raw = None    # what it had before
+		self.fake = None        # the stand-in raw: a group node (tracker) or a proxy (input)
 
 	def override(self, name, func):
 		d = getattr(self.obj, '__dict__', None)
@@ -1695,6 +1706,22 @@ class _VrSim(object):
 			except Exception:
 				pass
 		rec.pose = {'position': pos, 'euler': eul}
+		# vizconnect links the raw tracker to the tracker's node every frame, so the pose only
+		# reaches the view and the hands if the raw object itself is replaced. Tracker.setRaw
+		# re-links it; a plain group then holds the simulated pose.
+		if all(hasattr(obj, n) for n in ('setRaw', 'getRaw')) and hasattr(viz, 'addGroup'):
+			try:
+				fake = viz.addGroup()
+				fake.setPosition(pos)
+				fake.setEuler(eul)
+				rec.orig_raw = obj.getRaw()
+				obj.setRaw(fake)
+				rec.wrapper, rec.fake = obj, fake
+				self.trackers[key] = rec
+				return rec
+			except Exception as e:
+				self.notes.append('%s: setRaw failed (%s: %s); overriding its methods instead'
+				                  % (key, type(e).__name__, e))
 		for name in _POSE_METHODS:
 			orig = getattr(obj, name, None)
 			if orig is None:
@@ -1714,7 +1741,14 @@ class _VrSim(object):
 		rec = self.inputs.get(key)
 		if rec is not None:
 			return rec
-		rec = _VrObject(key, obj)
+		# Button queries go to the raw device (wrapper.getRaw()), which is what apps poll.
+		raw = None
+		try:
+			raw = obj.getRaw()
+		except Exception:
+			pass
+		rec = _VrObject(key, raw if raw is not None else obj)
+		obj = rec.obj
 
 		def is_down(button, *a, **k):
 			if _vr_token(button) in rec.equivalents():
@@ -1741,20 +1775,54 @@ class _VrSim(object):
 				mask |= 1 << i
 			return (val or 0) | mask if isinstance(val, int) or val is None else val
 
-		if hasattr(obj, 'isButtonDown'):
-			rec.override('isButtonDown', is_down)
-		if hasattr(obj, 'isButtonUp'):
-			rec.override('isButtonUp', lambda b, *a, **k: not is_down(b, *a, **k))
-		if hasattr(obj, 'getButtonState'):
-			rec.override('getButtonState', state)
-		if not rec.saved:
+		def mouse_state(*a, **k):
+			try:
+				val = int(rec.call_original('getState', *a, **k) or 0)
+			except Exception:
+				val = 0
+			for i in rec.equivalents():
+				if isinstance(i, int):
+					val |= 1 << i
+			return val
+
+		funcs = {'isButtonDown': is_down, 'isButtonUp': lambda b, *a, **k: not is_down(b, *a, **k),
+		         'getButtonState': state, 'getState': mouse_state}
+		present = [n for n in funcs if hasattr(obj, n)]
+		try:
+			for n in present:
+				rec.override(n, funcs[n])
+		except (ValueError, AttributeError, TypeError):
+			# A built-in device object takes no new attributes: give the wrapper a proxy instead.
+			rec.restore()
+			wrapper = self._wrapper_of(key)
+			if wrapper is not None and hasattr(wrapper, 'setRaw') and raw is not None:
+				rec.orig_raw, rec.wrapper = raw, wrapper
+				rec.fake = _VrRawProxy(raw, dict((n, funcs[n]) for n in present))
+				wrapper.setRaw(rec.fake)
+				self.notes.append('%s: device object is read-only, so vizconnect now reads a proxy; code '
+				                  'that kept a reference to the original device does not see presses'
+				                  % key)
+			else:
+				self.notes.append('%s: device object is read-only; only events are sent' % key)
+		if not present:
 			self.notes.append('%s: has none of %s; only events are sent' % (key, ', '.join(_BUTTON_METHODS)))
 		self.inputs[key] = rec
 		return rec
 
+	def _wrapper_of(self, key):
+		vc = sys.modules.get('vizconnect')
+		try:
+			return {str(k): v for k, v in vc.getInputDict().items()}.get(key)
+		except Exception:
+			return None
+
 	def apply_nodes(self):
 		for rec in self.trackers.values():
 			try:
+				if rec.fake is not None:
+					rec.fake.setPosition(rec.pose['position'])
+					rec.fake.setEuler(rec.pose['euler'])
+					continue
 				node = rec.obj.getNode3d()
 				if node is not None:
 					node.setPosition(rec.pose['position'])
@@ -1781,13 +1849,11 @@ class _VrSim(object):
 		const = getattr(viz, 'SENSOR_DOWN_EVENT' if kind == 'down' else 'SENSOR_UP_EVENT', None)
 		if const is None:
 			return 'viz has no SENSOR_%s_EVENT' % kind.upper()
-		raw = rec.obj
+		# Handlers (vizact.onsensordown, viztask.waitSensorDown) read e.object and e.button,
+		# and match e.object against the device they registered, i.e. the original raw device.
+		raw = rec.orig_raw if rec.orig_raw is not None else rec.obj
 		try:
-			raw = rec.obj.getRaw() or rec.obj
-		except Exception:
-			pass
-		try:
-			viz.sendEvent(const, raw, token)
+			viz.sendEvent(const, viz.Event(object=raw, button=token))
 		except Exception as e:
 			return '%s: %s' % (type(e).__name__, e)
 		return None
@@ -1802,6 +1868,7 @@ class _VrSim(object):
 		self.stop_hold()
 		for rec in list(self.trackers.values()) + list(self.inputs.values()):
 			rec.restore()
+			_vr_unswap(rec, errors)
 		self.trackers.clear()
 		self.inputs.clear()
 		return errors
@@ -1809,10 +1876,46 @@ class _VrSim(object):
 	def status(self):
 		return {
 			'trackers': {k: {'position': _jsonable(r.pose['position']), 'euler': _jsonable(r.pose['euler']),
-			                 'overridden': sorted(r.saved)} for k, r in self.trackers.items()},
-			'inputs': {k: {'down': sorted(map(str, r.down)), 'overridden': sorted(r.saved)}
+			                 'overridden': sorted(r.saved), 'raw_swapped': r.fake is not None}
+			             for k, r in self.trackers.items()},
+			'inputs': {k: {'down': sorted(map(str, r.down)), 'overridden': sorted(r.saved),
+			               'raw_swapped': r.fake is not None}
 			           for k, r in self.inputs.items()},
 		}
+
+
+class _VrRawProxy(object):
+	"""Stands in for a read-only raw input device: the simulated button methods, and everything
+	else passed through to the device."""
+
+	def __init__(self, raw, funcs):
+		self.__dict__['_raw'] = raw
+		self.__dict__.update(funcs)
+
+	def __getattr__(self, name):
+		return getattr(self.__dict__['_raw'], name)
+
+	def __setattr__(self, name, value):
+		if name in self.__dict__ and name != '_raw':
+			self.__dict__[name] = value
+		else:
+			setattr(self.__dict__['_raw'], name, value)
+
+
+def _vr_unswap(rec, errors):
+	"""Give a vizconnect wrapper its own raw object back and drop the stand-in."""
+	if rec.wrapper is None:
+		return
+	try:
+		rec.wrapper.setRaw(rec.orig_raw)
+	except Exception as e:
+		errors.append('%s: setRaw back failed (%s: %s)' % (rec.key, type(e).__name__, e))
+	if rec.fake is not None and hasattr(rec.fake, 'remove') and not isinstance(rec.fake, _VrRawProxy):
+		try:
+			rec.fake.remove()
+		except Exception:
+			pass
+	rec.wrapper = rec.fake = rec.orig_raw = None
 
 
 def _vr_derived(rec, name, orig):
@@ -1937,6 +2040,7 @@ def cmd_vr_simulate(p):
 	for key, rec in list(sim.inputs.items()):       # nothing held: give the device its own methods back
 		if not rec.down:
 			rec.restore()
+			_vr_unswap(rec, event_errors)
 			del sim.inputs[key]
 	res = sim.status()
 	res.update({'events': events, 'event_errors': event_errors, 'notes': sim.notes, 'frames': frames})

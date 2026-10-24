@@ -227,9 +227,9 @@ class FakeTracker(object):
 
 
 class FakeInput(object):
+	"""A raw input device, as vizconnect's Input.getRaw() returns it: the object apps poll."""
 	def __init__(self, bits=0):
 		self.bits = bits
-		self.raw = object()
 
 	def isButtonDown(self, b):
 		return b == 7
@@ -237,8 +237,17 @@ class FakeInput(object):
 	def getButtonState(self):
 		return self.bits
 
+
+class FakeInputWrapper(object):
+	"""vizconnect's Input wrapper: no button methods of its own, just the raw device."""
+	def __init__(self, raw):
+		self.raw = raw
+
 	def getRaw(self):
 		return self.raw
+
+	def setRaw(self, raw):
+		self.raw = raw
 
 
 @pytest.fixture
@@ -246,7 +255,8 @@ def vr(vm, monkeypatch):
 	viz = vm.viz_stub
 	viz.SENSOR_DOWN_EVENT, viz.SENSOR_UP_EVENT = 'down', 'up'
 	viz.events = []
-	viz.sendEvent = lambda *a: viz.events.append(a)
+	viz.Event = lambda **kw: types.SimpleNamespace(**kw)
+	viz.sendEvent = lambda const, e: viz.events.append((const, e.object, e.button))
 	holds = []
 
 	class Handle(object):
@@ -263,7 +273,8 @@ def vr(vm, monkeypatch):
 	vc = types.ModuleType('vizconnect')
 	vc.getTrackerDict = lambda: {'head': head, 'left_hand': lhand, 'right_touch_hand': rhand}
 	right_in, left_in = FakeInput(), FakeInput()
-	vc.getInputDict = lambda: {'left_controller': left_in, 'right_controller': right_in}
+	wrappers = {'left_controller': FakeInputWrapper(left_in), 'right_controller': FakeInputWrapper(right_in)}
+	vc.getInputDict = lambda: dict(wrappers)
 	monkeypatch.setitem(sys.modules, 'vizconnect', vc)
 	vm.trk = types.SimpleNamespace(head=head, left=lhand, right=rhand)
 	vm.inp = types.SimpleNamespace(left=left_in, right=right_in)
@@ -320,11 +331,11 @@ def test_vr_buttons_hold_for_n_frames_then_release(vr):
 	gen = vr.cmd_vr_simulate({'press': ['right_controller:trigger'], 'frames': 3, 'button_map': {'trigger': 1}})
 	next(gen)
 	states.append((inp.isButtonDown('trigger'), inp.isButtonDown(1), inp.getButtonState(), inp.isButtonDown(7)))
-	assert vr.viz_stub.events == [('down', inp.raw, 1)]
+	assert vr.viz_stub.events == [('down', inp, 1)]
 	res = drive(vr, gen)
 	assert states == [(True, True, 0b10, True)]
 	assert (inp.isButtonDown('trigger'), inp.getButtonState()) == (False, 0)
-	assert vr.viz_stub.events[-1] == ('up', inp.raw, 1)
+	assert vr.viz_stub.events[-1] == ('up', inp, 1)
 	assert res['events'] == ['down right_controller:trigger', 'up right_controller:trigger']
 	assert vr.inp.left.isButtonDown('trigger') is False
 
@@ -344,7 +355,7 @@ def test_vr_press_stays_down_until_release(vr):
 def test_vr_needs_to_know_which_input(vr):
 	with pytest.raises(ValueError, match='which input'):
 		sim(vr, press=['trigger'])
-	vr.vc.getInputDict = lambda: {'only': vr.inp.left}
+	vr.vc.getInputDict = lambda: {'only': FakeInputWrapper(vr.inp.left)}
 	sim(vr, press=['trigger'])
 	assert vr.inp.left.isButtonDown('trigger')
 
@@ -631,3 +642,78 @@ def test_server_validate_argument_checks_and_errors(app):
 	app['handler'] = lambda req: {'ok': False, 'error': "ValueError: unknown name 'K'"}
 	with pytest.raises(ToolError, match='unknown name'):
 		call('validate', {'watch': 'w', 'measured': 'h', 'theory': 'K'})
+
+
+@pytest.mark.parametrize('names, alias, expected', [
+	(['head_tracker', 'r_hand_tracker', 'eye_tracker'], 'right_hand', 'r_hand_tracker'),
+	(['head_tracker', 'l_hand_tracker', 'r_hand_tracker'], 'left_hand', 'l_hand_tracker'),
+	(['hmd', 'LHand', 'RHand'], 'right_hand', 'RHand'),
+	(['head', 'Left Controller', 'Right Controller'], 'left_hand', 'Left Controller'),
+	(['head_tracker', 'r_hand_tracker', 'eye_tracker'], 'head', 'head_tracker'),
+])
+def test_vr_hand_aliases_match_common_tracker_names(vm, names, alias, expected):
+	assert vm._vr_resolve({n: object() for n in names}, alias, 'tracker') == expected
+
+
+class FakeGroup(object):
+	def __init__(self):
+		self.pos, self.euler, self.removed = None, None, False
+
+	def setPosition(self, v):
+		self.pos = list(v)
+
+	def setEuler(self, v):
+		self.euler = list(v)
+
+	def remove(self):
+		self.removed = True
+
+
+class SwappableTracker(FakeTracker):
+	"""A vizconnect Tracker: its raw sensor is linked to the node, so poses must go via setRaw."""
+	def __init__(self, *a, **k):
+		FakeTracker.__init__(self, *a, **k)
+		self.raw = 'real sensor'
+
+	def getRaw(self):
+		return self.raw
+
+	def setRaw(self, raw):
+		self.raw = raw
+
+
+def test_vr_poses_swap_the_raw_tracker_and_restore_it(vr):
+	vr.viz_stub.addGroup = FakeGroup
+	head = SwappableTracker([0, 1.8, 0], [0, 0, 0])
+	vr.vc.getTrackerDict = lambda: {'head_tracker': head, 'r_hand_tracker': vr.trk.right}
+	res = sim(vr, poses={'head': {'position': [1, 1.7, -2], 'euler': [45, 0, 0]}})
+	fake = head.raw
+	assert isinstance(fake, FakeGroup) and fake.pos == [1, 1.7, -2] and fake.euler == [45, 0, 0]
+	assert res['trackers']['head_tracker']['raw_swapped'] is True and 'getPosition' not in vars(head)
+	sim(vr, poses={'head': {'position': [2, 1.7, -2]}})
+	assert head.raw is fake and fake.pos == [2, 1.7, -2]
+	sim(vr, reset=True)
+	assert head.raw == 'real sensor' and fake.removed
+
+
+class ReadOnlyDevice(object):
+	"""A built-in device object: methods cannot be replaced on the instance."""
+	__slots__ = ()
+
+	def isButtonDown(self, b):
+		return False
+
+	def getState(self):
+		return 0
+
+
+def test_vr_read_only_device_gets_a_proxy_through_setraw(vr):
+	dev = ReadOnlyDevice()
+	wrapper = FakeInputWrapper(dev)
+	vr.vc.getInputDict = lambda: {'r_hand_input': wrapper}
+	res = sim(vr, press=['r_hand_input:0'])
+	assert wrapper.raw is not dev and wrapper.raw.isButtonDown(0) and wrapper.raw.getState() == 1
+	assert res['inputs']['r_hand_input']['raw_swapped'] is True
+	assert vr.viz_stub.events[-1] == ('down', dev, 0)                # handlers registered on the device
+	sim(vr, release=['all'])
+	assert wrapper.raw is dev
