@@ -24,3 +24,38 @@ jobs:
         run: python -m pip install -e ".[test]"
       - name: Run tests
         run: python -m pytest -v
+
+  package:
+    # Builds what would go to PyPI (nothing is published) and checks it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+      - name: twine check
+        run: twine check --strict dist/*
+      - name: Wheel carries the Vizard-side files
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist()
+          need = ['vizard_mcp/vizard_side/vizmcp.py', 'vizard_mcp/vizard_side/vizmcp_boot.py']
+          missing = [n for n in need if n not in names]
+          assert not missing, 'missing from the wheel: %s' % missing
+          PY
+      - name: Install the wheel in a clean environment and run it
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/vizard-mcp --version
+          HOME=/tmp/smoke-home /tmp/smoke/bin/vizard-mcp install --claude-code --dry-run
+          /tmp/smoke/bin/python -m vizard_mcp doctor || test $? -eq 1     # 1 = a FAIL (no Vizard on CI); a crash is not
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

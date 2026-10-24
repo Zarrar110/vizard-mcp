@@ -4,7 +4,6 @@ The tools forward to the vizmcp module inside Vizard (see vizard_side/vizmcp.py)
 over a localhost socket. Images are prepared here, outside Vizard.
 """
 
-import glob
 import json
 import os
 import subprocess
@@ -16,7 +15,7 @@ from typing import Any
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import __version__, api_index, imaging
+from . import api_index, doctor as doctor_mod, imaging, video, winviz
 from .client import NotConnected, VizardClient, VizardError
 
 VIZARD_SIDE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vizard_side')
@@ -35,7 +34,9 @@ Before writing Vizard code, check exact names and signatures with vizard_api.
 
 Seeing: screenshot (annotate=true labels named nodes), multi_view (orbit a node from
 several angles without disturbing the user's view), filmstrip (frames over time), pick
-(what is at a point of a screenshot).
+(what is at a point of a screenshot). For people to watch: record_video (MP4) and record_tour
+(MP4 while the camera flies along keyframes or orbits a node; dry_run previews the path).
+doctor checks the installation.
 Measuring: watch_start / watch_read / watch_plot record any expressions every frame
 (e.g. a deflection or a velocity) so results can be checked against theory, and
 watch_export writes them to CSV or JSON for reports;
@@ -93,17 +94,10 @@ def _jpeg(im):
 # ---------------------------------------------------------------------------
 
 def find_winviz():
-	exe = os.environ.get('VIZARD_EXE')
-	if exe and os.path.isfile(exe):
-		return exe
-	roots = [os.environ.get('ProgramFiles', r'C:\Program Files'),
-	         os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')]
-	found = []
-	for root in roots:
-		found += glob.glob(os.path.join(root, 'WorldViz', 'Vizard*', 'bin', 'winviz.exe'))
-	if not found:
+	exe = winviz.locate()
+	if not exe:
 		raise VizardToolError('winviz.exe not found. Set the VIZARD_EXE environment variable to its full path.')
-	return sorted(found)[-1]
+	return exe
 
 
 def _tail(path, n=40):
@@ -442,12 +436,121 @@ def filmstrip(count: int = 6, interval_s: float = 0.5, max_size: int = 1400) -> 
 	        'frames %s' % [s['frame'] for s in shots]]
 
 
+def _video_paths(path, fmt):
+	"""(avi_path, final_path) for a recording; None for what Vizard should name itself."""
+	if not path:
+		return None, None
+	stem, ext = os.path.splitext(os.path.abspath(path))
+	return stem + '.avi', stem + ('.mp4' if fmt == 'mp4' else '.avi')
+
+
+def _check_video_options(fmt, crf, fps, max_size):
+	if fmt not in ('mp4', 'avi'):
+		raise VizardToolError('format must be "mp4" or "avi".')
+	if not 0 <= crf <= 51:
+		raise VizardToolError('crf must be 0..51 (lower is better quality; 23 is the default).')
+	if fps is not None and not 0 < fps <= 240:
+		raise VizardToolError('fps must be more than 0 and at most 240.')
+	if max_size is not None and max_size < 16:
+		raise VizardToolError('max_size must be at least 16 pixels.')
+
+
+def _finish_video(res, fmt, crf, fps, max_size):
+	"""Turn Vizard's AVI into an MP4 when asked. The AVI is deleted after a successful
+	conversion and kept, with the reason, when the conversion fails."""
+	if fmt == 'avi':
+		res['format'] = 'avi'
+		return res
+	avi = res['path']
+	mp4 = os.path.splitext(avi)[0] + '.mp4'
+	try:
+		out = video.convert_to_mp4(avi, mp4, crf=crf, fps=fps, max_size=max_size)
+	except video.VideoError as e:
+		return dict(res, format='avi', mp4_converted=False,
+		            mp4_error='%s\nThe uncompressed AVI was kept at %s' % (e, avi))
+	try:
+		os.remove(avi)
+	except OSError as e:
+		out['note'] = 'could not delete the AVI %s: %s' % (avi, e)
+	return dict(res, path=out['path'], bytes=out['bytes'], format='mp4', mp4_converted=True,
+	            avi_bytes=res['bytes'], avi_deleted='note' not in out, ffmpeg=out['ffmpeg'],
+	            ffmpeg_source=out['ffmpeg_source'], **({'note': out['note']} if 'note' in out else {}))
+
+
 @mcp.tool()
-def record_video(seconds: float = 5.0, path: str | None = None) -> str:
-	"""Record the Vizard window to an AVI file with Vizard's built-in recorder, for people
-	to watch (use filmstrip to look at motion yourself). Returns the file path."""
-	return _dump(_call('record_video', wait_s=seconds + 120, seconds=seconds,
-	                   path=os.path.abspath(path) if path else None))
+def record_video(seconds: float = 5.0, path: str | None = None, format: str = 'mp4', crf: int = 23,
+                 fps: float | None = None, max_size: int | None = None) -> str:
+	"""Record the Vizard window to a video file, for people to watch (use filmstrip to look at
+	motion yourself). Returns the file path.
+
+	format: "mp4" (default) records with Vizard's built-in recorder, which writes an
+	        uncompressed AVI (about 25 MB per second at 800x600), then converts it here to
+	        H.264 MP4 (yuv420p, even dimensions, fast-start) and deletes the AVI. If no ffmpeg
+	        can be found, or the conversion fails, the AVI is kept and the result says why.
+	        ffmpeg is looked for in $VIZMCP_FFMPEG, on PATH, then in the imageio-ffmpeg package
+	        (pip install "vizard-mcp[video]"). "avi" keeps the raw AVI.
+	crf: H.264 quality, 0..51, lower is better and larger (default 23).
+	fps: resample the output to this frame rate (default: keep the recording's).
+	max_size: shrink so the longest side is at most this many pixels (never enlarges)."""
+	_check_video_options(format, crf, fps, max_size)
+	avi, _ = _video_paths(path, format)
+	res = _call('record_video', wait_s=seconds + 120, seconds=seconds, path=avi)
+	return _dump(_finish_video(res, format, crf, fps, max_size))
+
+
+@mcp.tool(structured_output=False)
+def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None = None,
+                target: list[float] | None = None, radius: float | None = None,
+                elevation_deg: float = 25.0, degrees: float = 360.0, start_yaw_deg: float = 45.0,
+                duration: float | None = None, interp: str = 'catmull', path: str | None = None,
+                format: str = 'mp4', crf: int = 23, fps: float | None = None, max_size: int | None = None,
+                dry_run: bool = False, count: int = 6, preview_size: int = 1400) -> Any:
+	"""Record a video while the camera flies along a path (a fly-through or an orbit). The view
+	is held for the duration and then given back exactly as the user had it. The output is MP4
+	like record_video (see there for format, crf, fps, max_size and ffmpeg).
+
+	Give one of:
+	keyframes: list of {"position": [x,y,z], "euler": [yaw,pitch,roll] OR "look_at": [x,y,z],
+	           "t": seconds}. Use euler in all keyframes or look_at in all. Positions (and look_at
+	           points) follow a Catmull-Rom spline through the keyframes by default; angles turn
+	           the short way round. t is optional for all keyframes (they are then spread evenly
+	           over `duration`); the path holds its last pose if duration is longer.
+	orbit / target: circle around a node (id or expression; radius defaults to 2.8 x its
+	           half-size) or a world point (radius defaults to 5), looking at it, from
+	           elevation_deg above the horizontal, turning `degrees` (360 = one full circle,
+	           negative = the other way) starting at yaw start_yaw_deg, over `duration` (default 8 s).
+	interp: "catmull" (smooth through the keyframes), "smoothstep" (eases to a stop at each) or "linear".
+	dry_run: record nothing; return a grid image of `count` (2..12) frames along the path
+	         (preview_size = longest side of the grid) so the path can be judged first.
+
+	Vizard is Y-up, left-handed; euler is [yaw, pitch, roll] in degrees."""
+	_check_video_options(format, crf, fps, max_size)
+	if (keyframes is None) == (orbit is None and target is None):
+		raise VizardToolError('Give keyframes, or orbit / target to circle around (not both).')
+	if interp not in ('catmull', 'smoothstep', 'linear'):
+		raise VizardToolError('interp must be "catmull", "smoothstep" or "linear".')
+	if duration is not None and duration <= 0:
+		raise VizardToolError('duration must be more than 0.')
+	if dry_run:
+		n = max(2, min(12, count))
+		res = _call('record_tour', wait_s=30 + 8 * n, keyframes=keyframes, orbit=orbit, target=target,
+		            radius=radius, elevation_deg=elevation_deg, degrees=degrees, start_yaw_deg=start_yaw_deg,
+		            duration=duration, interp=interp, dry_run=True, count=n)
+		shots = res['shots']
+		images = [imaging.load(s['path']) for s in shots]
+		captions = [s['view'].get('label') or 'frame %d' % (i + 1) for i, s in enumerate(shots)]
+		text = '%s over %.2f s (dry run, nothing recorded)\n' % (res.get('path'), res['duration'])
+		text += '\n'.join('%s: camera %s -> %s' % (c, s['view'].get('position'),
+		                                           s['view'].get('look_at') or s['view'].get('euler'))
+		                   for c, s in zip(captions, shots))
+		return [_jpeg(imaging.grid(images, captions, preview_size)), text]
+	avi, _ = _video_paths(path, format)
+	last_t = max([float(k['t']) for k in keyframes or [] if isinstance(k, dict) and k.get('t') is not None] or [0])
+	total = duration or last_t or 8.0
+	res = _call('record_tour', wait_s=total + 120, keyframes=keyframes, orbit=orbit, target=target,
+	            radius=radius, elevation_deg=elevation_deg, degrees=degrees, start_yaw_deg=start_yaw_deg,
+	            duration=duration, interp=interp, out_path=avi)
+	return _dump(_finish_video(res, format, crf, fps, max_size))
 
 
 @mcp.tool()
@@ -697,6 +800,15 @@ def profile(frames: int = 120, top: int = 25, sort: str = 'self') -> str:
 
 
 @mcp.tool()
+def doctor() -> str:
+	"""Check the vizard-mcp installation and print PASS / WARN / FAIL lines with a fix for each:
+	Python, mcp and Pillow versions, winviz.exe and the Vizard folder, the vizmcp port, ffmpeg
+	for MP4 videos, and whether the server is registered in Claude Code and Claude Desktop with a
+	command path that exists. Local checks only; nothing is sent over the network."""
+	return doctor_mod.render(doctor_mod.run_checks())
+
+
+@mcp.tool()
 def call_command(command: str, params: dict[str, Any] | None = None) -> str:
 	"""Call an app-specific command that the script registered with
 	vizmcp.register(name, func)."""
@@ -704,16 +816,8 @@ def call_command(command: str, params: dict[str, Any] | None = None) -> str:
 
 
 def main():
-	if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-V'):
-		print('vizard-mcp', __version__)
-		return
-	if len(sys.argv) > 2 and sys.argv[1] == 'copy-module':
-		import shutil
-		dest = os.path.abspath(sys.argv[2])
-		shutil.copy(os.path.join(VIZARD_SIDE, 'vizmcp.py'), dest)
-		print('copied vizmcp.py to', dest)
-		return
-	mcp.run()
+	from .cli import main as cli_main
+	cli_main()
 
 
 if __name__ == '__main__':

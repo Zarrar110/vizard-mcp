@@ -609,15 +609,19 @@ def cmd_screenshot(p):
 	return _capture(p.get('path'))
 
 
-def _orbit_views(p):
+def _orbit_center(p, default_radius=5.0):
+	"""(center, radius) of what to orbit: a node's bounding box, or a world point + radius."""
 	if p.get('orbit') is not None:
 		node = _resolve_node(p['orbit'])
 		bb = node.getBoundingBox(viz.ABS_GLOBAL)
 		if not bb.valid():
 			raise ValueError('node %r has no bounding box to orbit' % p['orbit'])
-		center, radius = list(bb.center), 0.5 * max(bb.size)
-	else:
-		center, radius = _vec(p['target']), float(p.get('radius', 5.0))
+		return list(bb.center), 0.5 * max(bb.size)
+	return _vec(p['target']), float(p.get('radius') or default_radius)
+
+
+def _orbit_views(p):
+	center, radius = _orbit_center(p)
 	count = max(1, min(12, int(p.get('count', 4))))
 	elev = math.radians(float(p.get('elevation_deg', 25)))
 	dist = float(p.get('distance') or max(radius * 2.8, 1.0))
@@ -671,15 +675,14 @@ def cmd_filmstrip(p):
 	return {'shots': shots}
 
 
-def cmd_record_video(p):
-	"""Record the window to an AVI file for `seconds` (Vizard's built-in recorder)."""
-	seconds = float(p.get('seconds', 5))
-	path = os.path.abspath(p.get('path') or _new_path('video', 'avi'))
+def _record_window(path, seconds):
+	"""Generator: record the window to an AVI for `seconds`, wait for the file to stop
+	growing, and return what was written."""
 	if _State.recording:
 		raise ValueError('already recording to %s' % _State.recording['path'])
 	viz.window.startRecording(path)
-	_State.recording = {'path': path}
 	t0, f0 = time.time(), viz.getFrameNumber()
+	_State.recording = {'path': path, 't0': t0}
 	try:
 		while time.time() - t0 < seconds:
 			yield
@@ -696,6 +699,193 @@ def cmd_record_video(p):
 		last = size
 	return {'path': path, 'bytes': os.path.getsize(path) if os.path.exists(path) else 0,
 	        'seconds': round(time.time() - t0, 2), 'frames': frames}
+
+
+def cmd_record_video(p):
+	"""Record the window to an AVI file for `seconds` (Vizard's built-in recorder)."""
+	seconds = float(p.get('seconds', 5))
+	path = os.path.abspath(p.get('path') or _new_path('video', 'avi'))
+	return (yield from _record_window(path, seconds))
+
+
+# ---------------------------------------------------------------------------
+# Camera tours: a path through space and time, for record_tour
+# ---------------------------------------------------------------------------
+
+def _smoothstep(u):
+	return u * u * (3.0 - 2.0 * u)
+
+
+def _shortest_delta(a, b):
+	"""Signed turn in degrees from angle a to angle b, the short way round."""
+	return (b - a + 180.0) % 360.0 - 180.0
+
+
+def _wrap_angle(a):
+	return (a + 180.0) % 360.0 - 180.0
+
+
+def _blend(vals, i, u, mode):
+	"""Point at fraction u of segment i..i+1 of the control points `vals` (lists of floats)."""
+	b, c = vals[i], vals[i + 1]
+	if mode == 'linear':
+		return [x + (y - x) * u for x, y in zip(b, c)]
+	if mode == 'smoothstep':
+		s = _smoothstep(u)
+		return [x + (y - x) * s for x, y in zip(b, c)]
+	a = vals[max(i - 1, 0)]
+	d = vals[min(i + 2, len(vals) - 1)]
+	u2, u3 = u * u, u * u * u
+	return [0.5 * (2.0 * q + (-p + r) * u + (2.0 * p - 5.0 * q + 4.0 * r - s) * u2 + (-p + 3.0 * q - 3.0 * r + s) * u3)
+	        for p, q, r, s in zip(a, b, c, d)]
+
+
+def _unwrap(angles):
+	"""Make a series of angles continuous by always turning the short way round."""
+	out = [angles[0]]
+	for a in angles[1:]:
+		out.append(out[-1] + _shortest_delta(out[-1], a))
+	return out
+
+
+class _TourPath(object):
+	"""A camera pose as a function of time: pose(t) -> {"position": [...], "euler" or "look_at": [...]}."""
+
+	def __init__(self, duration, pose, kind, description):
+		self.duration, self.pose, self.kind, self.description = duration, pose, kind, description
+
+	def at(self, t):
+		return self.pose(min(max(t, 0.0), self.duration))
+
+
+def _keyframe_path(frames, duration, interp):
+	if interp not in ('catmull', 'smoothstep', 'linear'):
+		raise ValueError('interp must be "catmull", "smoothstep" or "linear"')
+	if not isinstance(frames, (list, tuple)) or len(frames) < 2:
+		raise ValueError('keyframes needs at least 2 entries of {"position", "euler" or "look_at", "t"}')
+	modes = set()
+	for k, f in enumerate(frames):
+		if not isinstance(f, dict) or f.get('position') is None:
+			raise ValueError('keyframes[%d] needs a position' % k)
+		has_e, has_l = f.get('euler') is not None, f.get('look_at') is not None
+		if has_e == has_l:
+			raise ValueError('keyframes[%d] needs exactly one of euler or look_at' % k)
+		modes.add('euler' if has_e else 'look_at')
+	if len(modes) > 1:
+		raise ValueError('use euler in every keyframe or look_at in every keyframe, not a mix')
+	mode = modes.pop()
+	have_t = [f.get('t') is not None for f in frames]
+	if any(have_t) and not all(have_t):
+		raise ValueError('give t on every keyframe or on none')
+	if all(have_t):
+		times = [float(f['t']) for f in frames]
+		if times[0] < 0 or any(b <= a for a, b in zip(times, times[1:])):
+			raise ValueError('keyframe times t must be 0 or more and strictly increasing')
+		total = float(duration) if duration else times[-1]
+	else:
+		if not duration:
+			raise ValueError('give duration, or t on every keyframe')
+		total = float(duration)
+		times = [total * k / (len(frames) - 1) for k in range(len(frames))]
+	if total <= 0:
+		raise ValueError('duration must be more than 0')
+	pos = [_vec(f['position']) for f in frames]
+	if mode == 'euler':
+		cols = [_unwrap([_vec(f['euler'])[ax] for f in frames]) for ax in range(3)]
+		rot = [[cols[0][k], cols[1][k], cols[2][k]] for k in range(len(frames))]
+	else:
+		rot = [_vec(f['look_at']) for f in frames]
+
+	def pose(t):
+		if t <= times[0]:
+			i, u = 0, 0.0
+		elif t >= times[-1]:
+			i, u = len(times) - 2, 1.0
+		else:
+			i = max(k for k in range(len(times)) if times[k] <= t)
+			u = (t - times[i]) / (times[i + 1] - times[i])
+		out = {'position': _blend(pos, i, u, interp)}
+		r = _blend(rot, i, u, interp)
+		out[mode] = [_wrap_angle(a) for a in r] if mode == 'euler' else r
+		return out
+	return _TourPath(total, pose, 'keyframes', '%d keyframes (%s)' % (len(frames), interp))
+
+
+def _orbit_path(center, dist, elevation_deg, degrees, start_yaw_deg, duration):
+	if duration <= 0:
+		raise ValueError('duration must be more than 0')
+	if dist <= 0:
+		raise ValueError('radius must be more than 0')
+	elev = math.radians(elevation_deg)
+
+	def pose(t):
+		yaw = math.radians(start_yaw_deg + degrees * t / duration)
+		return {'position': [center[0] + dist * math.cos(elev) * math.sin(yaw),
+		                     center[1] + dist * math.sin(elev),
+		                     center[2] + dist * math.cos(elev) * math.cos(yaw)],
+		        'look_at': list(center)}
+	return _TourPath(duration, pose, 'orbit', 'orbit of %g degrees at radius %g' % (degrees, dist))
+
+
+def _tour_path(p):
+	duration = p.get('duration')
+	if p.get('keyframes') is not None:
+		if p.get('orbit') is not None or p.get('target') is not None:
+			raise ValueError('give keyframes or an orbit (orbit/target), not both')
+		return _keyframe_path(p['keyframes'], duration, p.get('interp') or 'catmull')
+	if p.get('orbit') is None and p.get('target') is None:
+		raise ValueError('give keyframes, or orbit (a node) or target (a world point) to circle around')
+	center, size = _orbit_center(p)
+	if p.get('radius'):
+		dist = float(p['radius'])
+	else:
+		dist = max(size * 2.8, 1.0) if p.get('orbit') is not None else size
+	return _orbit_path(center, dist, float(p.get('elevation_deg', 25.0)), float(p.get('degrees', 360.0)),
+	                   float(p.get('start_yaw_deg', 45.0)), float(duration or 8.0))
+
+
+def _apply_pose(pose):
+	v = viz.MainView
+	v.setPosition(pose['position'])
+	if pose.get('look_at') is not None:
+		v.lookAt(pose['look_at'])
+	else:
+		v.setEuler(pose['euler'])
+
+
+def cmd_record_tour(p):
+	"""Move the view along a path while recording, or (dry_run) capture a few frames along it.
+	The view is held for the duration and then given back exactly as it was."""
+	path = _tour_path(p)
+	if p.get('dry_run'):
+		count = max(2, min(12, int(p.get('count', 6))))
+		views = []
+		for k in range(count):
+			t = path.duration * k / (count - 1)
+			views.append(dict(path.at(t), label='t = %.2f s' % t))
+		res = yield from cmd_multi_view({'views': views, 'settle_frames': int(p.get('settle_frames', 3))})
+		res.update(dry_run=True, duration=path.duration, path=path.description)
+		return res
+	if _State.recording:
+		raise ValueError('already recording to %s' % _State.recording['path'])
+	out = os.path.abspath(p.get('out_path') or _new_path('tour', 'avi'))
+	v = viz.MainView
+	prev_apply, prev_pos, prev_eul = _State.hold_apply, v.getPosition(), v.getEuler()
+
+	def apply():
+		rec = _State.recording
+		_apply_pose(path.at(time.time() - rec['t0'] if rec else 0.0))
+	try:
+		apply()
+		_set_hold(apply)
+		yield from _wait_frames(3)
+		res = yield from _record_window(out, path.duration)
+	finally:
+		_set_hold(prev_apply)
+		v.setPosition(prev_pos)
+		v.setEuler(prev_eul)
+	res.update(duration=path.duration, path_kind=path.kind, path_description=path.description)
+	return res
 
 
 def _to_screen(point):
@@ -2241,6 +2431,7 @@ COMMANDS = {
 	'multi_view': cmd_multi_view,
 	'filmstrip': cmd_filmstrip,
 	'record_video': cmd_record_video,
+	'record_tour': cmd_record_tour,
 	'project': cmd_project,
 	'screen_labels': cmd_screen_labels,
 	'pick': cmd_pick,

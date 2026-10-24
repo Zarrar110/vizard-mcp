@@ -10,13 +10,14 @@ Needs a real Vizard install. Under pytest it is skipped unless VIZMCP_LIVE=1.
 import csv
 import json
 import os
+import subprocess
 import sys
 
 if __name__ != '__main__' and os.environ.get('VIZMCP_LIVE') != '1':
 	import pytest
 	pytest.skip('needs a real Vizard install; set VIZMCP_LIVE=1 to run', allow_module_level=True)
 
-from vizard_mcp import server as S
+from vizard_mcp import server as S, video
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = os.path.join(HERE, '..', 'examples', 'demo_scene.py')
@@ -46,6 +47,26 @@ def button_center():
 	if rc.get('error'):
 		return None, rc['error'].strip().splitlines()[-1]
 	return json.loads(rc['value'].replace("'", '"')), None
+
+
+def plays_as_h264(path):
+	"""Does the file exist, have a size, and does ffprobe / ffmpeg -i report an h264 video stream?
+	Returns (ok, detail). Uses the same ffmpeg the server converts with."""
+	if not os.path.isfile(path) or os.path.getsize(path) == 0:
+		return False, 'missing or empty: %s' % path
+	found = video.find_ffmpeg()
+	if found is None:
+		return False, 'no ffmpeg to inspect the file with'
+	ffmpeg = found[0]
+	ffprobe = os.path.join(os.path.dirname(ffmpeg), 'ffprobe' + os.path.splitext(ffmpeg)[1])
+	if os.path.basename(ffmpeg).lower().startswith('ffmpeg') and os.path.isfile(ffprobe):
+		cmd = [ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+		       'stream=codec_name,pix_fmt,width,height', '-of', 'csv=p=0', path]
+		out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode()
+	else:       # e.g. imageio-ffmpeg's renamed binary has no ffprobe next to it: `ffmpeg -i` prints the streams
+		out = subprocess.run([ffmpeg, '-hide_banner', '-i', path], stdout=subprocess.PIPE,
+		                     stderr=subprocess.STDOUT).stdout.decode()
+	return 'h264' in out, '%d bytes; %s' % (os.path.getsize(path), ' '.join(out.split())[:200])
 
 
 def save(img, name):
@@ -165,9 +186,35 @@ try:
 	pk = j(S.pick(x=0.5, y=0.02))
 	check('pick sky = no hit', not pk['hit'], pk)
 
-	vid = j(S.record_video(seconds=2, path=os.path.join(OUT, 'demo.avi')))
-	check('record_video', vid['bytes'] > 10000, vid)
+	vid = j(S.record_video(seconds=2, path=os.path.join(OUT, 'demo.avi'), format='avi'))
+	check('record_video avi', vid['bytes'] > 10000 and vid['format'] == 'avi', vid)
 	os.remove(vid['path'])      # uncompressed AVI, tens of MB
+
+	vid = j(S.record_video(seconds=2, path=os.path.join(OUT, 'demo.mp4')))
+	ok, detail = plays_as_h264(vid['path'])
+	check('record_video mp4 plays (h264)', vid.get('mp4_converted') and vid['format'] == 'mp4' and ok
+	      and not os.path.exists(os.path.splitext(vid['path'])[0] + '.avi'), (vid.get('mp4_error') or detail))
+	info('record_video mp4', {k: vid.get(k) for k in ('bytes', 'avi_bytes', 'frames', 'seconds', 'ffmpeg_source')})
+
+	cam_before = j(S.camera())
+	preview = S.record_tour(orbit='turntable', duration=4, dry_run=True, count=4)
+	save(preview[0], 'tour_preview.jpg')
+	check('record_tour dry_run filmstrip', 'dry run' in preview[1] and j(S.camera()) == cam_before, preview[1].splitlines()[0])
+	tour = j(S.record_tour(orbit='turntable', duration=3, degrees=180, path=os.path.join(OUT, 'orbit_tour.mp4')))
+	ok, detail = plays_as_h264(tour['path'])
+	check('record_tour orbit mp4 plays (h264)', tour.get('mp4_converted') and ok, tour.get('mp4_error') or detail)
+	check('record_tour restores the camera', j(S.camera()) == cam_before, (cam_before, j(S.camera())))
+	check('record_tour released the hold', not j(S.vizard_status()).get('camera_held'))
+	bb = j(S.node_info('turntable'))['bbox']
+	cx, cy, cz = bb['center']
+	r = max(bb['size']) * 2.5
+	kf = [{'position': [cx + r, cy + r / 2, cz + r], 'look_at': [cx, cy, cz], 't': 0},
+	      {'position': [cx, cy + r, cz + r * 1.2], 'look_at': [cx, cy, cz], 't': 1.5},
+	      {'position': [cx - r, cy + r / 2, cz + r], 'look_at': [cx, cy, cz], 't': 3}]
+	fly = j(S.record_tour(keyframes=kf, path=os.path.join(OUT, 'fly_tour.mp4'), max_size=640))
+	ok, detail = plays_as_h264(fly['path'])
+	check('record_tour keyframes mp4 plays (h264)', fly.get('mp4_converted') and ok and fly['duration'] == 3, fly.get('mp4_error') or detail)
+	check('record_tour restores the camera (keyframes)', j(S.camera()) == cam_before)
 
 	# --- driving -----------------------------------------------------------
 	j(S.send_key(' ', hold_frames=3))

@@ -42,19 +42,32 @@ Vizard's scene graph is not thread-safe. The socket threads in `vizmcp` only que
 ## Install
 
 ```bash
+pip install vizard-mcp
+vizard-mcp install
+vizard-mcp doctor
+```
+
+`vizard-mcp install` registers the server in Claude Code (`~/.claude.json`) and Claude Desktop (`%APPDATA%\Claude\claude_desktop_config.json`), whichever are installed. It backs the file up first, leaves your other servers alone, and does nothing when run a second time. `--dry-run` shows the change without writing it; `--claude-code` / `--claude-desktop` pick a client explicitly, `--name` and `--command` override the server name and program. Restart Claude Desktop (or start a new Claude Code session) afterwards.
+
+`vizard-mcp doctor` prints PASS / WARN / FAIL with a fix for each problem: Python, `mcp` and Pillow versions, `winviz.exe` and its Vizard folder, whether port 9877 is free or a vizmcp app answers, whether ffmpeg is available for MP4 videos, whether the server is registered in Claude Code and Claude Desktop, and whether the registered command still exists. It makes no network calls (only a connection to `127.0.0.1`) and exits with 1 if anything FAILs. The assistant can run the same checks with the `doctor` tool.
+
+For MP4 videos you need an ffmpeg: either already on `PATH`, or `pip install "vizard-mcp[video]"` (bundles one through `imageio-ffmpeg`), or point `VIZMCP_FFMPEG` at it.
+
+From a clone (to hack on it):
+
+```bash
 git clone https://github.com/Zarrar110/vizard-mcp
 cd vizard-mcp
 python -m venv .venv
-.venv\Scripts\pip install -e .
+.venv\Scripts\pip install -e ".[video,test]"
+.venv\Scripts\vizard-mcp install
 ```
 
-### Claude Code
+Without the installer, register it by hand:
 
 ```bash
 claude mcp add --scope user vizard -- C:/path/to/vizard-mcp/.venv/Scripts/vizard-mcp.exe
 ```
-
-### Claude Desktop (or any MCP client using a JSON config)
 
 ```json
 {
@@ -95,6 +108,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `launch_app` | Start a script with vizmcp injected and wait until it answers (`env` for app switches) |
 | `quit_app` | Close the app cleanly |
 | `reload_module` | Reload one of the app's own modules after editing it |
+| `doctor` | The same checks as `vizard-mcp doctor`: versions, Vizard, port, ffmpeg, Claude registration, with a fix for each problem |
 
 **Inspect**
 
@@ -117,7 +131,8 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `screenshot_diff` | Compare the window with a reference PNG for visual regression: percentage of pixels that differ, a diff image (changes in red, changed areas boxed), and pass/fail against an optional `threshold_pct`. `pixel_tolerance` absorbs anti-aliasing noise; `update_reference=true` writes the current window as the new baseline. The reference must be the same size as the window |
 | `multi_view` | Orbit a node (or point) from N angles, or a list of views, in one grid image; the user's view is restored exactly |
 | `filmstrip` | N frames over time in one grid, to see motion |
-| `record_video` | AVI recording with Vizard's built-in recorder, for people to watch (uncompressed: about 25 MB per second at 800x600) |
+| `record_video` | Record the window for people to watch. Default `format="mp4"`: Vizard's recorder writes an uncompressed AVI (about 25 MB per second at 800x600), which the server then converts to H.264 MP4 (yuv420p, even dimensions, fast-start) and deletes. `crf` (quality, default 23), `fps` and `max_size` tune the output. If no ffmpeg is found or the conversion fails, the AVI is kept and the result says why. `format="avi"` keeps the raw AVI |
+| `record_tour` | Record a video while the camera moves along a path, then give the user's camera back. Either `keyframes` (`[{position, euler or look_at, t}]`, positions on a Catmull-Rom spline or eased/linear via `interp`, angles turning the short way round) or an `orbit` around a node / `target` point (`radius`, `elevation_deg`, `degrees`, `duration`). Output as `record_video`. `dry_run=true` records nothing and returns a grid of `count` frames along the path to judge it first |
 | `pick` | What is at a screen point: node, script name or nearest named ancestor, world point, normal, distance; ignores the user's own avatar head |
 | `project` | Where world points or node centers appear on screen |
 | `camera` | Get/set `viz.MainView`; `hold` keeps the view even when vizconnect drives it |
@@ -172,6 +187,7 @@ The assistant calls it with `call_command("reset_experiment", {"seed": 3})`. A c
 | `VIZMCP_PORT` | `9877` | Port, on both sides |
 | `VIZMCP_TOKEN` | none | If set on both sides, every request must carry it |
 | `VIZARD_EXE` | auto | Full path to `winviz.exe` |
+| `VIZMCP_FFMPEG` | auto | Full path to `ffmpeg` for MP4 conversion; otherwise `PATH`, then the `imageio-ffmpeg` package |
 
 Screenshots, CSV files and recordings go to `%TEMP%\vizmcp` unless a path is given.
 
@@ -188,6 +204,19 @@ Screenshots, CSV files and recordings go to `%TEMP%\vizmcp` unless a path is giv
 - `profile` measures Python only. If Python milliseconds per frame are far below the frame time, the app is bound by rendering or vsync.
 - `click` needs the Vizard window visible on screen. A mouse-look navigator may also react to the click.
 - Scripts that open a dialog at startup (e.g. hardware selection) must be told to skip it through `env`, or `launch_app` waits until its timeout.
+
+### `record_tour` in detail
+
+```text
+record_tour(orbit="LAB.site.crane", duration=10, degrees=360, elevation_deg=20)
+record_tour(keyframes=[{"position": [0, 2, -8], "look_at": [0, 1, 0], "t": 0},
+                       {"position": [6, 3, -2], "look_at": [0, 1, 0], "t": 3},
+                       {"position": [8, 2, 5],  "look_at": [0, 1, 0], "t": 6}],
+            path="C:/out/flythrough.mp4")
+record_tour(orbit="ball", dry_run=True, count=6)          # preview only, nothing is recorded
+```
+
+The camera pose is a function of the time since the recording started, applied every frame after the app and vizconnect have moved the view (the same hold `camera(hold=true)` uses), so the video follows real time whatever the frame rate. Keyframes use `euler` in all of them or `look_at` in all of them. Without `t` they are spread evenly over `duration`; `duration` longer than the last `t` holds the final pose. When the tour ends, or fails, the hold is released and the user's position and euler (and any hold they had) are put back. For an orbit, `radius` is the camera distance from the centre; for a node it defaults to 2.8 times half its largest bounding-box side, for a point to 5. The conversion to MP4 happens in the server, so no extra software is needed inside Vizard.
 
 ### `vr_simulate` in detail
 
@@ -219,6 +248,8 @@ The offline tests use stand-ins that follow the calls the code makes. These part
 - **`gui_list` / `click_button`**: the widget class names (`VizButton`, `VizSlider`, ...) and the text, enabled and value accessors (`getMessage`, `getEnabled`, `getState`, ...) are probed by name and report `null` when missing; whether a given widget type exposes them is unverified. Window coordinates rely on `getBoundingBox().center` being normalized with a bottom-left origin (converted with `1 - y`); the demo's Reset button is checked in `tests/live_test.py`. Telling screen-space from world-space widgets is done by walking parents up to the scene's roots, which is unverified for widgets on a vizconnect wrist panel.
 - **`vr_simulate`**: run on a real vizconnect app (a bridge lab on Vizard 8.3.1 with the desktop vizconnect config). A posed head moved `viz.MainView` (yaw +45°, new position), a posed right hand moved the hand node, a press on the hand input showed in the mouse device's `getState()` and reached a `SENSOR_DOWN_EVENT` handler with the right device and button, and `reset` restored the view and hand exactly. Not yet tried with OpenXR or SteamVR controllers. The demo scene has no vizconnect, so `tests/live_test.py` only checks the error path. Button names have no built-in mapping to indexes; pass `button_map` for your device.
 - **`validate`**: the math and statistics are covered offline and checked against the demo's free fall in `tests/live_test.py`.
+- **`record_video` MP4 / `record_tour`**: the ffmpeg command line is run against a real ffmpeg in the offline tests when one is installed (synthetic odd-sized AVI in, H.264, yuv420p, even dimensions and `moov` before `mdat` out), and the path maths, hold/restore and file handling are covered offline against stand-ins. Not yet run against a real Vizard 8.3: that `viz.window.startRecording` output (frame timing, pixel format, size) converts cleanly with the user's ffmpeg, that the held camera pose really lands on every recorded frame on top of `viz.MainView` (and over vizconnect), that the `look_at` / `euler` conventions give the intended view (an orbit's `lookAt` is the same call `multi_view` uses; keyframe `euler` is passed straight to `setEuler`), and that the video plays at real speed. `tests/live_test.py` checks a 2 s MP4, an orbit tour, a keyframe tour and a dry run on the demo scene, and that each file reports `h264`.
+- **`vizard-mcp install` / `doctor`**: tested offline with temporary `HOME` / `APPDATA` folders. Not yet run on a Windows machine with Claude Code and Claude Desktop installed; the Claude Code check reads `mcpServers` in `~/.claude.json` (user scope and per-project entries), and the Vizard version is only what the install folder name says (`Vizard8` gives `8`).
 
 ## Running the tests
 
@@ -229,7 +260,9 @@ pip install -e ".[test]"
 pytest
 ```
 
-It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 35 tools, error handling, stdio handshake), plus vizmcp's newer commands (GUI listing and clicking, `vr_simulate`, `validate`, `watch_export`, `scene_stats`) run against stand-ins for Vizard's `viz` and `vizconnect` modules.
+It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 37 tools, error handling, stdio handshake), plus vizmcp's newer commands (GUI listing and clicking, `vr_simulate`, `validate`, `watch_export`, `scene_stats`, the camera-tour maths and `record_tour`) run against stand-ins for Vizard's `viz` and `vizconnect` modules. MP4 conversion is tested with a tiny fake `ffmpeg` script (and a real one when installed), and `doctor` / `install` with temporary `HOME` and `APPDATA` folders.
+
+CI also builds the sdist and wheel, runs `twine check`, and installs the wheel in a clean environment (nothing is published).
 
 Two scripts need more and are not part of the default run:
 

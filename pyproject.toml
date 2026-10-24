@@ -11,25 +11,43 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Zarrar Abbas", email = "zarrarabbas73@gmail.com" }]
-keywords = ["mcp", "vizard", "worldviz", "vr", "virtual-reality", "claude"]
+keywords = ["mcp", "model-context-protocol", "vizard", "worldviz", "vr", "virtual-reality", "claude"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Environment :: Console",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "Topic :: Software Development :: Testing",
 ]
 dependencies = ["mcp>=2.3,<3", "pillow>=10"]
 
 [project.optional-dependencies]
+video = ["imageio-ffmpeg>=0.5"]
 test = ["pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/Zarrar110/vizard-mcp"
+Source = "https://github.com/Zarrar110/vizard-mcp"
 Issues = "https://github.com/Zarrar110/vizard-mcp/issues"
 
 [project.scripts]
-vizard-mcp = "vizard_mcp.server:main"
+vizard-mcp = "vizard_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vizard_mcp"]
+# vizard_side/ is not a Python package (it runs inside Vizard's own interpreter); list it so
+# the wheel is guaranteed to carry vizmcp.py and vizmcp_boot.py for launch_app and copy-module.
+include = ["src/vizard_mcp/**"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/examples", "/README.md", "/LICENSE", "/pyproject.toml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
