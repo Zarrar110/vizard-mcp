@@ -96,6 +96,36 @@ Copy `vizmcp.py` next to your script with `vizard-mcp copy-module C:\MyLab`, or 
 
 `winviz.exe` is found under `C:\Program Files\WorldViz\Vizard*`; set `VIZARD_EXE` to override.
 
+### Exhibition PC / LAN
+
+The app can run on another PC (for example the exhibition machine) while the assistant runs on yours. vizmcp listens on `127.0.0.1` unless it is told otherwise.
+
+**On the exhibition PC** (the one running the Vizard app), set both variables before the app starts:
+
+```bat
+set VIZMCP_BIND=192.168.1.50
+set VIZMCP_TOKEN=a-long-random-secret
+```
+
+`VIZMCP_BIND` is the PC's own LAN address (or `0.0.0.0` for every interface). vizmcp **refuses to listen beyond this PC without `VIZMCP_TOKEN`** and says so in the console. Open the port in the Windows firewall for the private network only, from an administrator prompt:
+
+```bat
+netsh advfirewall firewall add rule name="vizmcp" dir=in action=allow protocol=TCP localport=9877 profile=private remoteip=192.168.1.0/24
+```
+
+Use your own subnet for `remoteip`, so only that LAN can reach the port. Remove the rule when the show is over: `netsh advfirewall firewall delete rule name="vizmcp"`. The network profile must be *Private*; Windows blocks inbound traffic on *Public* networks by default.
+
+**On your PC**, point the server at it, either with variables before the assistant starts
+
+```bat
+set VIZMCP_HOST=192.168.1.50
+set VIZMCP_TOKEN=a-long-random-secret
+```
+
+or at any time with the `connect` tool (`connect(host="192.168.1.50", token="...")`), which reports what it reaches. `vizard-mcp doctor` shows the target and whether it answers. Because `launch_app` starts `winviz.exe` on the PC the server runs on, it refuses while the target is another PC: start the app there yourself.
+
+**Security.** vizmcp has `run_code`, which runs any Python in the app, and the token is the only protection: it is sent as plain text and the traffic is not encrypted. Use it on a trusted, private LAN only; never forward the port to the internet or expose it on a guest or public network, use a long random token, and stop the app or remove the firewall rule when you are done. Files are written where the code that makes them runs. With an app on another PC, images (`screenshot`, `screenshot_diff`, `multi_view`, `filmstrip`, `record_tour` with `dry_run`, and so `crawl_gui`) are fetched over the same connection, so they work (the `save_to` copy is written on your PC). `record_video` and `record_tour` refuse, because the video is written on the app PC. A `path` for `snapshot_save`, `snapshot_restore`, `watch_export` and the `validate` CSV is opened by the app, so it means a folder on the app PC.
+
 ## Tools
 
 Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are referenced by numeric id or any Python expression in the app (`"ground"`, `"LAB.site.crane.hook"`, `"cars[2]"`).
@@ -105,7 +135,8 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | Tool | What it does |
 |---|---|
 | `vizard_status` | Connected? Script, versions, frame, FPS, window, camera, node count, watches, commands |
-| `launch_app` | Start a script with vizmcp injected and wait until it answers (`env` for app switches) |
+| `connect` | Choose which app the server talks to: `host`, `port`, `token` (settings you leave out stay; the token is never echoed). Reports whether the target answers, whether it is this PC, and the app's script and version. See [Exhibition PC / LAN](#exhibition-pc--lan) |
+| `launch_app` | Start a script with vizmcp injected and wait until it answers (`env` for app switches). Only for an app on this PC; with a remote target it refuses and says so |
 | `quit_app` | Close the app cleanly |
 | `reload_module` | Reload one of the app's own modules after editing it |
 | `doctor` | The same checks as `vizard-mcp doctor`: versions, Vizard, port, ffmpeg, Claude registration, with a fix for each problem |
@@ -145,6 +176,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `click` | Real mouse click in the Vizard window (GUI buttons, sliders, mouse handlers). Coordinates are 0..1 of the window's client area; the window is brought to the foreground (and restored if minimised) when it is not already there; refuses if another window covers the point; cursor restored |
 | `gui_list` | The app's 2D GUI widgets (buttons, labels, checkboxes, sliders, textboxes, ...): `id`, script names, class, kind, text, `visible`, `enabled` and `center`/`size` as 0..1 of the window from the top-left (same as screenshots). Widgets parented into the 3D scene, such as a vizconnect wrist or tablet panel, are listed apart as `world_widgets` with a world position and are not clickable |
 | `click_button` | Click a 2D widget by `label` (exact text, then ignoring case, then a case-insensitive part of the text) or by `id`, through the same real-mouse path as `click`. Hidden or disabled widgets are skipped; no match or several matches is an error that lists the candidates |
+| `crawl_gui` | Smoke-test the 2D GUI: for each visible, enabled button (optionally those matching the regex `label`, at most `max_buttons`) capture the window, click it by id, wait `settle_frames`, read the new console lines and Python exceptions, diff the window against the capture and put the scene back from a snapshot (`restore=true`, built with `snapshot_save`'s `nodes` / `named` / `pattern` / `root` / `state` / `restore_code`). Returns a table (button, changed %, errors, new log lines) plus details and the skipped buttons. Buttons whose text matches `deny` (default `quit|exit|close|delete`) and buttons without text are never clicked. Usable in `make_report` as a `crawl_gui` section |
 | `vr_simulate` | Drive vizconnect without a headset: hold head and left/right hand tracker poses (`position`, `euler`) and press, release or hold named input buttons for N frames, to test wrist-tablet menus, laser pointers and grabs on a desktop. Undone by `reset`, on `quit_app` and when the app exits. Errors clearly if the app does not use vizconnect |
 | `wait` | Let N frames and/or seconds pass |
 | `wait_until` | Run until a Python condition is true in the app (`"truck.x > 30"`) |
@@ -156,7 +188,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `snapshot_save` | Remember the local position, orientation (quaternion), scale and visibility of chosen nodes under a name, to put back later: `nodes` (ids or expressions), `named` (every named node, optionally filtered by `pattern`) and/or `root` (a node and everything under it). Optionally also app state: `state` is an expression whose value is copied, `restore_code` a statement that puts it back with the copy as `_state`. `path` also writes a JSON file |
 | `snapshot_restore` | Put a snapshot back (state first, then nodes), from the app's memory by `name` or from a JSON `path`. Reports the nodes that were `missing` (deleted, or no longer found by name) and any value a node refused; the rest are still restored |
 | `snapshot_list` | The snapshots kept in the app; with `path`, describes a snapshot file without needing the app |
-| `make_report` | One self-contained HTML report (images inlined as base64, print-friendly CSS, nothing else to carry around; print it to PDF from a browser) from `sections`: `heading`, `text` (paragraphs, lists, bold/italic/code/links), `watch` (summary table + chart), `validate` (PASS/FAIL badge, error statistics, measured-vs-theory chart), `screenshot` (taken now), `image` (an existing file) and `keyvalue`. The header has the title, author (default Zarrar Abbas), date and what is known of the app and Vizard |
+| `make_report` | One self-contained HTML report (images inlined as base64, print-friendly CSS, nothing else to carry around; print it to PDF from a browser) from `sections`: `heading`, `text` (paragraphs, lists, bold/italic/code/links), `watch` (summary table + chart), `validate` (PASS/FAIL badge, error statistics, measured-vs-theory chart), `screenshot` (taken now), `image` (an existing file), `keyvalue`, `asset_check` (runs the audit now unless you pass its `result`) and `crawl_gui` (the latest crawl of this server, or the `result` you pass; a report never starts a crawl). The header has the title, author (default Zarrar Abbas), date and what is known of the app and Vizard |
 
 **Measure**
 
@@ -168,6 +200,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `watch_export` | Write every sample of a watch to a `.csv` or `.json` file (`path`; optional `columns` to pick and order them) for validation reports. JSON is `{watch, expressions, stop_reason, samples, columns, rows}` |
 | `validate` | Compare a recorded watch with theory: evaluate an expression over the watch's columns and `constants` (`"P*L**3/(48*E*I)"`, or just a reference column) for every sample and compare it with the `measured` column. Returns max/mean/RMS error, bias, % error, samples within tolerance (`abs_tol` and/or `pct_tol`, optional `t_min`/`t_max` window, `min_pass_pct`) with a pass/fail verdict, a per-sample CSV and a measured-vs-theory chart |
 | `scene_stats` | Why is a scene slow? Counts of nodes, visible nodes, node types, textures, approximate triangles (all and visible), lights, and the `top` heaviest nodes with their script names. A figure the running Vizard cannot provide is `null` with a note, and heavy nodes are then ranked by sub-node count |
+| `asset_check` | Audit the scene's assets from Vizard 8's `getStats`: totals (primitives, vertices, drawables, textures, texture MB; equal to `viz.MainScene.getStats()`), the `top` nodes by their own primitives, bounding-box **size outliers** (over `max_size_m` = 1000 m or under `min_size_m` = 1 mm on the longest side, or `sibling_ratio` = 100 times the median of their siblings, the usual unit bug of an exported GLB), nodes with nothing to draw, **hidden nodes that still hold primitives**, duplicated heavy subtrees (same file, else identical statistics), texture-memory hogs, and files missing on disk. File names are probed with `getFilename` / `getName` and are `null` where a node has none. `html=true` adds a fragment for reports; `make_report` has an `asset_check` section |
 | `profile` | cProfile of all main-thread Python for N frames: frame time mean/p95/max, FPS, Python ms per frame, top functions |
 | `call_command` | Call a command the app registered itself |
 
@@ -194,7 +227,9 @@ The assistant calls it with `call_command("reset_experiment", {"seed": 3})`. A c
 | Variable | Default | Meaning |
 |---|---|---|
 | `VIZMCP_PORT` | `9877` | Port, on both sides |
-| `VIZMCP_TOKEN` | none | If set on both sides, every request must carry it |
+| `VIZMCP_TOKEN` | none | If set on both sides, every request must carry it. Required when the app listens beyond this PC |
+| `VIZMCP_BIND` | `127.0.0.1` | App side: the interface vizmcp listens on. Anything but loopback needs `VIZMCP_TOKEN` |
+| `VIZMCP_HOST` | `127.0.0.1` | Server side: the PC whose app the tools talk to (`connect` changes it at run time) |
 | `VIZARD_EXE` | auto | Full path to `winviz.exe` |
 | `VIZMCP_FFMPEG` | auto | Full path to `ffmpeg` for MP4 conversion; otherwise `PATH`, then the `imageio-ffmpeg` package |
 
@@ -202,7 +237,7 @@ Screenshots, CSV files and recordings go to `%TEMP%\vizmcp` unless a path is giv
 
 ## Security
 
-`run_code` executes arbitrary Python inside your app, and `click` moves the real mouse. The socket binds to `127.0.0.1` only, so other machines cannot reach it, but any program on the same PC can. Set `VIZMCP_TOKEN` on shared machines, and do not start vizmcp in builds you hand to end users.
+`run_code` executes arbitrary Python inside your app, and `click` moves the real mouse. By default the socket binds to `127.0.0.1` only, so other machines cannot reach it, but any program on the same PC can. Set `VIZMCP_TOKEN` on shared machines, and do not start vizmcp in builds you hand to end users. Listening on a LAN address is possible only by setting `VIZMCP_BIND` and needs a token; see [Exhibition PC / LAN](#exhibition-pc--lan) for the firewall steps and its limits (no encryption, trusted LAN only).
 
 ## Limitations and tips
 
@@ -294,6 +329,9 @@ The theory is parsed, not run: numbers, the watch's columns (`t`, `frame` and th
 The offline tests use stand-ins that follow the calls the code makes. What has and has not been run against a real Vizard 8.3:
 
 - **`gui_list` / `click_button`**: the widget class names (`VizButton`, `VizSlider`, ...) and the text, enabled and value accessors (`getMessage`, `getEnabled`, `getState`, ...) are probed by name and report `null` when missing; whether a given widget type exposes them is unverified. Window coordinates rely on `getBoundingBox().center` being normalized with a bottom-left origin (converted with `1 - y`); the demo's Reset button is checked in `tests/live_test.py`. Telling screen-space from world-space widgets is done by walking parents up to the scene's roots, which is unverified for widgets on a vizconnect wrist panel.
+- **LAN / `connect`**: the bind and token rules, `connect`, `launch_app` refusing a remote target and doctor's remote check are tested offline, with a real vizmcp socket bound to `0.0.0.0` and a fake app standing in for the remote PC. Fetching screenshots over the socket (`fetch_file`) is tested the same way. Not tried across two real PCs, through the Windows firewall rule above, or on a real Vizard app with `VIZMCP_BIND` set. `tests/live_test.py` only connects to `127.0.0.1` explicitly.
+- **`asset_check`**: the maths and flags are tested offline against stand-in nodes. Needs a live run: that `getStats()` on a node counts its whole subtree the way the own-cost subtraction assumes (loaded models, groups, instanced children), that `getBoundingBox(viz.ABS_GLOBAL)` gives sensible sizes for models and groups, whether any node type in Vizard 8.3.1 really has `getFilename` / `getName` (otherwise files are `null` and duplicates are judged by statistics), and that the "nothing to draw" list is not noisy for the node types of a real app. `tests/live_test.py` checks that the totals equal `viz.MainScene.getStats()` on the demo scene.
+- **`crawl_gui`**: the flow (capture, click by id, settle, log, diff, restore) and the exception extraction are tested offline against a simulated app. Needs a live run on real buttons: the demo's Reset ball button must report a visible change and the `ball dropped` log line (checked in `tests/live_test.py`), and the Python tracebacks that a failing button callback really writes to `stderr` must match the traceback shape the extractor expects. Buttons that open modal dialogs or move the real mouse away have not been tried.
 - **`vr_simulate`**: run on a real vizconnect app (a bridge lab on Vizard 8.3.1 with the desktop vizconnect config). A posed head moved `viz.MainView` (yaw +45°, new position), a posed right hand moved the hand node, a press on the hand input showed in the mouse device's `getState()` and reached a `SENSOR_DOWN_EVENT` handler with the right device and button, and `reset` restored the view and hand exactly. Not yet tried with OpenXR or SteamVR controllers. The demo scene has no vizconnect, so `tests/live_test.py` only checks the error path. Button names have no built-in mapping to indexes; pass `button_map` for your device.
 - **`validate`**: the math and statistics are covered offline and checked against the demo's free fall in `tests/live_test.py`.
 - **`record_video` MP4 / `record_tour`**: run on Windows with Vizard 8.3.1 and the ffmpeg from `imageio-ffmpeg`.
@@ -313,7 +351,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 41 tools, error handling, stdio handshake), plus vizmcp's newer commands (GUI listing and clicking, `vr_simulate`, `validate`, `watch_export`, `scene_stats`, the camera-tour maths, `record_tour` in both modes, snapshots and report building) run against stand-ins for Vizard's `viz` and `vizconnect` modules. MP4 conversion is tested with a tiny fake `ffmpeg` script (and a real one when installed), and `doctor` / `install` with temporary `HOME` and `APPDATA` folders.
+It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 44 tools, error handling, stdio handshake), plus vizmcp's newer commands (GUI listing and clicking, `vr_simulate`, `validate`, `watch_export`, `scene_stats`, `asset_check`, `crawl_gui`, the LAN bind and token rules, the camera-tour maths, `record_tour` in both modes, snapshots and report building) run against stand-ins for Vizard's `viz` and `vizconnect` modules. MP4 conversion is tested with a tiny fake `ffmpeg` script (and a real one when installed), and `doctor` / `install` with temporary `HOME` and `APPDATA` folders.
 
 CI also builds the sdist and wheel, runs `twine check`, and installs the wheel in a clean environment (nothing is published).
 

@@ -163,3 +163,83 @@ def document(title, author, date, info, body, generator=None):
 	        '<title>%s</title>\n<style>\n%s</style></head>\n<body><main>\n'
 	        '<header><h1>%s</h1><p class="byline">%s</p>%s</header>\n%s\n%s\n</main></body></html>\n') % (
 		esc(title), CSS, esc(title), meta, info_html, '\n'.join(body), foot)
+
+
+# ---------------------------------------------------------------------------
+# Sections built from tool results (asset_check, crawl_gui)
+# ---------------------------------------------------------------------------
+
+def _mb(nbytes):
+	return '%.1f' % (nbytes / (1024.0 * 1024.0)) if nbytes else '0'
+
+
+def _who(row):
+	names = row.get('names') or []
+	return names[0] if names else '%s #%s' % (row.get('type', 'node'), row.get('id'))
+
+
+def asset_check_html(res, top=15):
+	"""HTML fragments (a list of strings) for an asset_check result."""
+	t = res.get('totals') or {}
+	out = [keyvalue([('Nodes', t.get('nodes')), ('Primitives', t.get('primitives')), ('Vertices', t.get('vertices')),
+	                 ('Drawables', t.get('drawables')), ('Textures', t.get('textures')),
+	                 ('Texture memory (MB)', t.get('texture_mb')), ('Totals from', t.get('source'))],
+	                'Scene totals')]
+	findings = res.get('findings') or []
+	out.append('<ul>%s</ul>' % ''.join('<li>%s</li>' % esc(f) for f in findings) if findings
+	           else '<p>%s No problems found by the checks.</p>' % badge(True))
+	rows = [[_who(r), r.get('type'), fmt(r.get('own_primitives')), fmt(r.get('primitives')), fmt(r.get('vertices')),
+	         fmt(r.get('textures')), _mb(r.get('texture_bytes')), fmt(r.get('size')), ', '.join(r.get('flags') or []),
+	         fmt(r.get('file'))] for r in (res.get('top_nodes') or [])[:top]]
+	if rows:
+		out.append(table(['Node', 'Type', 'Own prim.', 'Subtree prim.', 'Vertices', 'Textures', 'Tex. MB', 'Size (m)',
+		                  'Flags', 'File'], rows, 'Heaviest nodes (by their own primitives)', numeric_from=2))
+	rows = [[_who(r), fmt(r.get('size')), ', '.join(r.get('flags') or [])] for r in res.get('size_outliers') or []]
+	if rows:
+		out.append(table(['Node', 'Size (m)', 'Flags'], rows, 'Size outliers', numeric_from=9))
+	hid = res.get('hidden_costly') or {}
+	rows = [[_who(r), fmt(r.get('primitives'))] for r in hid.get('nodes') or []]
+	if rows:
+		out.append(table(['Hidden node', 'Primitives'], rows, 'Hidden nodes that still hold geometry'))
+	emp = res.get('empty_nodes') or {}
+	rows = [[_who(r), r.get('type')] for r in emp.get('nodes') or []]
+	if rows:
+		out.append(table(['Node', 'Type'], rows, 'Nodes with nothing to draw (%s)' % emp.get('count'), numeric_from=9))
+	rows = [[d.get('copies'), fmt(d.get('primitives_each')), fmt(d.get('wasted_primitives')), d.get('basis'),
+	         ', '.join(_who(n) for n in d.get('nodes') or [])] for d in res.get('duplicates') or []]
+	if rows:
+		out.append(table(['Copies', 'Primitives each', 'Wasted primitives', 'Judged by', 'Nodes'], rows,
+		                 'Duplicated heavy subtrees', numeric_from=0))
+	rows = [[_who(r), fmt(r.get('texture_mb')), fmt(r.get('share_of_texture_memory_pct')),
+	         'yes' if r.get('flagged') else 'no'] for r in res.get('texture_hogs') or []]
+	if rows:
+		out.append(table(['Node', 'Texture MB', '% of texture memory', 'Over limit'], rows, 'Texture memory'))
+	miss = (res.get('files') or {}).get('missing') or []
+	if miss:
+		out.append(table(['File', 'Node', 'Certain'], [[m.get('file'), _who(m), 'yes' if m.get('certain') else 'no']
+		                                              for m in miss], 'Files not found on disk', numeric_from=9))
+	notes = res.get('notes') or []
+	if notes:
+		out.append('<p class="note">%s</p>' % esc('; '.join(notes)))
+	return out
+
+
+def crawl_gui_html(res):
+	"""HTML fragments for a crawl_gui result."""
+	out = []
+	tab = res.get('table') or {}
+	rows = tab.get('rows') or []
+	s = res.get('summary') or {}
+	out.append(keyvalue([('Buttons found', s.get('buttons_found')), ('Clicked', s.get('clicked')),
+	                     ('Changed the screen', s.get('changed')), ('With errors', s.get('with_errors')),
+	                     ('Skipped', s.get('skipped'))], 'GUI smoke test'))
+	if rows:
+		out.append(table(tab.get('columns') or [], rows, numeric_from=1))
+	skipped = res.get('skipped') or []
+	if skipped:
+		out.append(table(['Button', 'Why not clicked'], [[x.get('label'), x.get('reason')] for x in skipped],
+		                 'Skipped', numeric_from=9))
+	errs = [(r.get('label'), e) for r in res.get('results') or [] for e in r.get('errors') or []]
+	if errs:
+		out.append(table(['Button', 'Exception'], errs, 'Python exceptions', numeric_from=9))
+	return out

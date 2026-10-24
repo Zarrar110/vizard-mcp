@@ -1,5 +1,6 @@
 """TCP client for the vizmcp module running inside Vizard."""
 
+import ipaddress
 import itertools
 import json
 import os
@@ -8,6 +9,18 @@ import threading
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 9877
+
+
+def is_local_host(host):
+	"""True for a loopback address or "localhost". A pure string check (no DNS), so a name that
+	merely resolves to this PC counts as remote: launch_app only starts apps on loopback."""
+	host = (host or '').strip().strip('[]').lower()
+	if host == 'localhost':
+		return True
+	try:
+		return ipaddress.ip_address(host).is_loopback
+	except ValueError:
+		return False
 
 
 class VizardError(RuntimeError):
@@ -29,6 +42,37 @@ class VizardClient(object):
 		self._ids = itertools.count(1)
 		self._lock = threading.Lock()
 
+	@property
+	def is_local(self):
+		return is_local_host(self.host)
+
+	def configure(self, host=None, port=None, token=None):
+		"""Point this client at another app. None keeps the current value; token="" clears it.
+		The connection is dropped so the next call reaches the new target."""
+		if host is not None:
+			self.host = host.strip()
+		if port is not None:
+			self.port = int(port)
+		if token is not None:
+			self.token = token or None
+		self.close()
+
+	def probe(self, timeout=3.0):
+		"""Ask the target once and say what happened, without raising:
+		('ok' | 'no_listener' | 'bad_token' | 'error', detail)."""
+		try:
+			self.call('ping', timeout=timeout)
+			return 'ok', 'a vizmcp app answered'
+		except NotConnected as e:
+			self.close()
+			return 'no_listener', str(e)
+		except VizardError as e:
+			self.close()
+			return ('bad_token' if 'token' in str(e) else 'error'), str(e)
+		except (ValueError, UnicodeDecodeError) as e:    # something answered, but not in vizmcp's protocol
+			self.close()
+			return 'error', 'the target did not speak the vizmcp protocol (%s)' % e
+
 	def close(self):
 		for x in (self._file, self._sock):
 			try:
@@ -42,9 +86,11 @@ class VizardClient(object):
 		try:
 			s = socket.create_connection((self.host, self.port), timeout=3.0)
 		except OSError as e:
-			raise NotConnected(
-				'No Vizard app is listening on %s:%d (%s). Start one with the launch_app tool, '
-				'or add "import vizmcp; vizmcp.start()" to the script.' % (self.host, self.port, e))
+			hint = ('Start one with the launch_app tool, or add "import vizmcp; vizmcp.start()" to the script.'
+			        if self.is_local else
+			        'Check that the app runs on that PC with VIZMCP_BIND and VIZMCP_TOKEN set, that the '
+			        'Windows firewall allows the port, and that host, port and token are right (connect tool).')
+			raise NotConnected('No Vizard app is listening on %s:%d (%s). %s' % (self.host, self.port, e, hint))
 		s.settimeout(self.timeout)
 		self._sock = s
 		self._file = s.makefile('rb')

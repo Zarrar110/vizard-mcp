@@ -435,6 +435,36 @@ try:
 	for q in ('triangle', 'getTexture', 'light'):
 		info('vizard_api %r' % q, S.vizard_api(q, limit=8).replace('\n', ' | '))
 
+	# asset_check: the totals are the scene's own getStats, and the per-node tables are filled in.
+	ac = j(S.asset_check(top=5, html=True))
+	sc = j(S.run_code('s = viz.MainScene.getStats()\n[s.primitiveCount, s.vertexCount, s.drawableCount, '
+	                  's.textureCount, s.textureBytes]'))
+	want = json.loads(sc['value'].replace("'", '"')) if 'value' in sc else None
+	t = ac['totals']
+	check('asset_check totals equal viz.MainScene.getStats()', want == [t['primitives'], t['vertices'], t['drawables'],
+	      t['textures'], t['texture_bytes']] and t['primitives'] > 0, (want, t))
+	check('asset_check ranks the heaviest nodes with names', 0 < len(ac['top_nodes']) <= 5
+	      and all(r['own_primitives'] >= 0 and 'size' in r for r in ac['top_nodes']), ac['top_nodes'][:2])
+	check('asset_check returns an HTML section', '<table' in ac['html_section'] and 'Scene totals' in ac['html_section'])
+	info('asset_check findings', ac['findings'])
+	info('asset_check notes', ac['notes'])
+	info('asset_check file probing', {'checked': ac['files']['checked'], 'missing': len(ac['files']['missing'])})
+
+	# crawl_gui: the demo's Reset ball button changes the picture and logs; the ball is put back after.
+	cg = j(S.crawl_gui(label='^Reset ball$', nodes=['ball'], settle_frames=10, save_dir=os.path.join(OUT, 'crawl')))
+	row = cg['results'][0] if cg['results'] else {}
+	check('crawl_gui clicked the Reset ball button', cg['summary']['clicked'] == 1 and row.get('label') == 'Reset ball', cg['summary'])
+	check('crawl_gui reports a change and the log line', row.get('changed') is True
+	      and any('ball dropped' in x for x in row.get('log', [])), row)
+	check('crawl_gui restored the snapshot without losses', row.get('restore', {}).get('restored') == 1
+	      and not row['restore'].get('missing') and not row['restore'].get('failed'), row.get('restore'))
+	info('crawl_gui table', cg['text_table'])
+
+	# connect: pointing the server at 127.0.0.1 explicitly still reaches this app.
+	cn = j(S.connect(host='127.0.0.1', port=S.client.port))
+	check('connect to 127.0.0.1 reports the app', cn['reachable'] and cn['local'] and cn['host'] == '127.0.0.1'
+	      and cn['app']['script'].endswith('demo_scene.py'), cn)
+
 	cam = j(S.camera(position=[0, 6, -9], look_at=[0, 1, 0], hold=True))
 	check('camera hold', abs(cam['position'][1] - 6) < 1e-4 and cam['held'], cam)
 	S.camera(release=True)

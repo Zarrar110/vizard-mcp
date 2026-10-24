@@ -1,8 +1,9 @@
 """`vizard-mcp doctor`: check the install and say how to fix what is wrong.
 
-Everything here is local: files, environment, importlib metadata and one connection to
-127.0.0.1. It never touches the network. Kept free of the mcp package so it still runs when
-mcp is the thing that is broken.
+Everything here is local - files, environment, importlib metadata - plus one connection to the
+vizmcp target (VIZMCP_HOST:VIZMCP_PORT, 127.0.0.1 unless you set it). The only traffic is that
+one ping, so with a remote target it reaches your LAN and nothing else. Kept free of the mcp
+package so it still runs when mcp is the thing that is broken.
 """
 
 import importlib.metadata
@@ -14,7 +15,7 @@ import sys
 from collections import namedtuple
 
 from . import __version__, install, video, winviz
-from .client import DEFAULT_PORT, VizardClient
+from .client import DEFAULT_HOST, DEFAULT_PORT, VizardClient, is_local_host
 
 PASS, WARN, FAIL = 'PASS', 'WARN', 'FAIL'
 Check = namedtuple('Check', 'status name detail hint')
@@ -61,12 +62,15 @@ def check_winviz():
 
 
 def check_port():
+	host = os.environ.get('VIZMCP_HOST') or DEFAULT_HOST
 	try:
 		port = int(os.environ.get('VIZMCP_PORT', DEFAULT_PORT))
 	except ValueError:
 		return Check(FAIL, 'vizmcp port', 'VIZMCP_PORT=%r is not a number' % os.environ.get('VIZMCP_PORT'),
 		             'Set VIZMCP_PORT to a port number, or remove it to use %d.' % DEFAULT_PORT)
-	client = VizardClient(port=port)
+	if not is_local_host(host):
+		return _check_remote(host, port)
+	client = VizardClient(host=host, port=port)
 	try:
 		if client.ping():
 			return Check(PASS, 'vizmcp port', 'port %d: a vizmcp app is answering' % port, '')
@@ -79,6 +83,43 @@ def check_port():
 	return Check(WARN, 'vizmcp port', 'port %d is in use, but not by a vizmcp app that answers' % port,
 	             'If it is an app of yours, check that VIZMCP_TOKEN matches on both sides. Otherwise set '
 	             'VIZMCP_PORT to another port (for the server and the app).')
+
+
+def _check_remote(host, port):
+	"""The target is another PC: it must answer; launch_app cannot start one there."""
+	name = 'vizmcp target'
+	where = '%s:%d (another PC; launch_app does not apply)' % (host, port)
+	client = VizardClient(host=host, port=port)
+	try:
+		state, detail = client.probe()
+	finally:
+		client.close()
+	if state == 'ok':
+		if not client.token:
+			return Check(WARN, name, '%s answers, but VIZMCP_TOKEN is not set here' % where,
+			             'A remote vizmcp app requires a token; set VIZMCP_TOKEN (or use the connect tool).')
+		return Check(PASS, name, '%s answers' % where, '')
+	if state == 'bad_token':
+		return Check(FAIL, name, '%s is there but rejected the token' % where,
+		             'Use the same VIZMCP_TOKEN as the app (or the connect tool with token=...).')
+	if state == 'no_listener':
+		return Check(FAIL, name, '%s does not answer' % where,
+		             'On that PC start the app with VIZMCP_BIND=<its LAN address> and VIZMCP_TOKEN set, '
+		             'allow the port in the Windows firewall (README: Exhibition PC / LAN), and check the '
+		             'address with ping.')
+	return Check(FAIL, name, '%s: %s' % (where, detail), 'Check VIZMCP_HOST and VIZMCP_PORT.')
+
+
+def check_exposure():
+	"""WARN when this machine's settings would put the app on the network without a token."""
+	bind = (os.environ.get('VIZMCP_BIND') or '').strip()
+	if bind and not is_local_host(bind) and not os.environ.get('VIZMCP_TOKEN'):
+		return Check(WARN, 'vizmcp exposure', 'VIZMCP_BIND=%s without VIZMCP_TOKEN' % bind,
+		             'vizmcp refuses to listen beyond 127.0.0.1 without a token; set VIZMCP_TOKEN, '
+		             'or remove VIZMCP_BIND.')
+	if bind and not is_local_host(bind):
+		return Check(PASS, 'vizmcp exposure', 'VIZMCP_BIND=%s with a token (keep this to a trusted LAN)' % bind, '')
+	return None
 
 
 def check_ffmpeg():
@@ -138,6 +179,9 @@ def run_checks():
 	          _package_check('mcp', 'mcp package', MIN_MCP, MAX_MCP),
 	          _package_check('pillow', 'Pillow', MIN_PILLOW),
 	          check_winviz(), check_port(), check_ffmpeg()]
+	exposure = check_exposure()
+	if exposure:
+		checks.append(exposure)
 	checks += check_registration('Claude Code', install.claude_code_config_path(), include_projects=True)
 	checks += check_registration('Claude Desktop', install.claude_desktop_config_path())
 	return checks

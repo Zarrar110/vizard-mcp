@@ -4,8 +4,11 @@ The tools forward to the vizmcp module inside Vizard (see vizard_side/vizmcp.py)
 over a localhost socket. Images are prepared here, outside Vizard.
 """
 
+import base64
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,7 +19,7 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import api_index, doctor as doctor_mod, imaging, report, video, winviz
-from .client import NotConnected, VizardClient, VizardError
+from .client import NotConnected, VizardClient, VizardError, is_local_host
 
 VIZARD_SIDE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vizard_side')
 
@@ -54,6 +57,12 @@ GUI: gui_list lists the app's 2D widgets (buttons, sliders, ...) with text and w
 position; click_button clicks one by its label. vr_simulate fakes a headset's tracker poses
 and button presses through vizconnect, to test VR menus on a desktop.
 Screen coordinates are 0..1 from the top-left corner of the screenshot.
+Assets: asset_check ranks nodes by cost and flags scale bugs, empty or hidden-but-costly nodes,
+duplicated heavy subtrees, texture hogs and missing files. crawl_gui clicks each safe 2D button in
+turn and reports what changed, which exceptions it raised and which lines it logged, undoing each
+click from a snapshot.
+The app may run on another PC (an exhibition machine): connect switches the host, port and token;
+launch_app and doctor only manage apps on this PC.
 
 Vizard is Y-up and left-handed; euler is [yaw, pitch, roll] in degrees.
 Vizard's free licence allows only one Vizard process at a time.
@@ -69,6 +78,7 @@ class VizardToolError(ToolError, RuntimeError):
 mcp = MCPServer('vizard-mcp', instructions=INSTRUCTIONS)
 client = VizardClient()
 _launched = {'proc': None, 'log': None}
+_last = {}       # the latest asset_check / crawl_gui result, for make_report sections
 
 
 def _call(cmd, wait_s=None, **params):
@@ -119,7 +129,7 @@ def vizard_status() -> str:
 	Vizard version, frame number, FPS, window size, camera, node count, active watches
 	and the commands it supports."""
 	if not client.ping():
-		msg = {'connected': False, 'port': client.port}
+		msg = {'connected': False, 'host': client.host, 'port': client.port}
 		proc = _launched['proc']
 		if proc is not None:
 			msg['launched_process_exit_code'] = proc.poll()
@@ -127,7 +137,49 @@ def vizard_status() -> str:
 		return _dump(msg)
 	info = _call('info')
 	info['connected'] = True
+	info['target'] = '%s:%d' % (client.host, client.port)
 	return _dump(info)
+
+
+@mcp.tool()
+def connect(host: str | None = None, port: int | None = None, token: str | None = None) -> str:
+	"""Choose which vizmcp app this server talks to, and report what it reaches. Without
+	arguments it only reports the current target. Settings you leave out stay as they are
+	(the starting values are VIZMCP_HOST, VIZMCP_PORT and VIZMCP_TOKEN); token="" clears the token.
+
+	host: 127.0.0.1 for this PC, or the address of another PC whose app was started with
+	      VIZMCP_BIND and VIZMCP_TOKEN (see the README: firewall, LAN only). launch_app works
+	      only for this PC.
+	The token is never echoed back; the result says whether one is set."""
+	if host is not None and not host.strip():
+		raise VizardToolError('host must not be empty (use 127.0.0.1 for this PC).')
+	if port is not None and not 0 < port < 65536:
+		raise VizardToolError('port must be 1..65535.')
+	client.configure(host=host, port=port, token=token)
+	return _dump(_target_report())
+
+
+def _target_report():
+	state, detail = client.probe()
+	out = {'host': client.host, 'port': client.port, 'local': client.is_local,
+	       'token_set': bool(client.token), 'reachable': state == 'ok'}
+	if state == 'ok':
+		try:
+			info = _call('info')
+			out['app'] = {k: info.get(k) for k in ('script', 'vizard_version', 'vizmcp_version', 'listening',
+			                                       'window_size', 'node_count')}
+		except VizardToolError as e:
+			out['app_error'] = str(e)
+	else:
+		out['problem'] = {'no_listener': 'nothing is listening there', 'bad_token': 'the app rejected the token',
+		                  'error': 'the target answered with an error'}[state]
+		out['detail'] = detail
+		if state == 'bad_token':
+			out['hint'] = 'use the same VIZMCP_TOKEN on the app and here (connect token=...)'
+	if not client.is_local and not client.token:
+		out['warning'] = ('no token set: a vizmcp app only listens on the network with a token, so this will '
+		                  'fail unless the app runs without one on a non-loopback address (it refuses to)')
+	return out
 
 
 @mcp.tool()
@@ -139,7 +191,14 @@ def launch_app(script: str, args: list[str] | None = None, env: dict[str, str] |
 
 	env: extra environment variables for the app (e.g. a switch that skips a startup dialog).
 	restart: if an app is already connected, ask it to quit first.
+
+	Works only for an app on this PC; with a remote target (see connect) it refuses.
 	"""
+	if not client.is_local:
+		raise VizardToolError(
+			'launch_app starts winviz.exe on this PC, but the connected target is %s:%d (another PC). '
+			'Start the app there yourself with VIZMCP_BIND and VIZMCP_TOKEN set and keep using connect, '
+			'or call connect(host="127.0.0.1") to work with an app on this PC.' % (client.host, client.port))
 	script = os.path.abspath(script)
 	if not os.path.isfile(script):
 		raise VizardToolError('No such script: %s' % script)
@@ -157,6 +216,8 @@ def launch_app(script: str, args: list[str] | None = None, env: dict[str, str] |
 	child_env['VIZMCP_PORT'] = str(client.port)
 	if client.token:
 		child_env['VIZMCP_TOKEN'] = client.token
+	else:
+		child_env.pop('VIZMCP_BIND', None)       # without a token the app would refuse to listen beyond this PC
 	log = open(log_path, 'wb')
 	# stdin must not be left attached: Vizard's Python can spin on a broken console stdin.
 	proc = subprocess.Popen(
@@ -326,10 +387,30 @@ def vizard_api(query: str = '', name: str | None = None, limit: int = 30) -> str
 # Seeing
 # ---------------------------------------------------------------------------
 
+def _app_image(path):
+	"""Load an image the app wrote. For an app on another PC the file is fetched over the socket
+	(the server cannot read that PC's disk)."""
+	if client.is_local:
+		return imaging.load(path)
+	res = _call('fetch_file', path=path)
+	return imaging.load(io.BytesIO(base64.b64decode(res['data'])))
+
+
+def _require_local_files(what):
+	if not client.is_local:
+		raise VizardToolError(
+			'%s writes a video on the PC where the app runs (%s), and this server cannot fetch it from '
+			'there. Run it with the app on this PC, or take the video on the app PC.' % (what, client.host))
+
+
 def _take_screenshot(save_to=None, annotate=False, label_limit=25):
 	"""Capture the window now; returns (full-size PIL image, description)."""
-	res = _call('screenshot', wait_s=30, path=os.path.abspath(save_to) if save_to else None)
-	im = imaging.load(res['path'])
+	remote = not client.is_local
+	res = _call('screenshot', wait_s=30, path=os.path.abspath(save_to) if save_to and not remote else None)
+	im = _app_image(res['path'])
+	if remote and save_to:
+		os.makedirs(os.path.dirname(os.path.abspath(save_to)), exist_ok=True)
+		im.save(os.path.abspath(save_to), 'PNG')
 	text = 'frame %s, window %s, saved at %s' % (res.get('frame'), res.get('window_size'), res['path'])
 	if annotate:
 		labels = _call('screen_labels', limit=label_limit)
@@ -376,7 +457,7 @@ def screenshot_diff(reference: str, threshold_pct: float | None = None, pixel_to
 		raise VizardToolError('threshold_pct must be 0..100.')
 	reference = os.path.abspath(reference)
 	res = _call('screenshot', wait_s=30)
-	current = imaging.load(res['path'])
+	current = _app_image(res['path'])
 	if update_reference:
 		os.makedirs(os.path.dirname(reference), exist_ok=True)
 		current.save(reference, 'PNG')
@@ -427,7 +508,7 @@ def multi_view(orbit: str | None = None, target: list[float] | None = None, radi
 	            count=count, elevation_deg=elevation_deg, distance=distance,
 	            start_yaw_deg=start_yaw_deg, views=views)
 	shots = res['shots']
-	images = [imaging.load(s['path']) for s in shots]
+	images = [_app_image(s['path']) for s in shots]
 	captions = [s['view'].get('label') or 'view %d' % (i + 1) for i, s in enumerate(shots)]
 	sheet = imaging.grid(images, captions, max_size)
 	text = '\n'.join('%s: camera %s -> %s' % (c, s['view'].get('position'), s['view'].get('look_at') or s['view'].get('euler'))
@@ -441,7 +522,7 @@ def filmstrip(count: int = 6, interval_s: float = 0.5, max_size: int = 1400) -> 
 	return them as one grid image, captioned with the time of each frame."""
 	res = _call('filmstrip', wait_s=30 + count * (interval_s + 2), count=count, interval_s=interval_s)
 	shots = res['shots']
-	images = [imaging.load(s['path']) for s in shots]
+	images = [_app_image(s['path']) for s in shots]
 	captions = ['t = %.2f s' % s['t_rel_s'] for s in shots]
 	return [_jpeg(imaging.grid(images, captions, max_size)),
 	        'frames %s' % [s['frame'] for s in shots]]
@@ -504,6 +585,7 @@ def record_video(seconds: float = 5.0, path: str | None = None, format: str = 'm
 	fps: resample the output to this frame rate (default: keep the recording's).
 	max_size: shrink so the longest side is at most this many pixels (never enlarges)."""
 	_check_video_options(format, crf, fps, max_size)
+	_require_local_files('record_video')
 	avi, _ = _video_paths(path, format)
 	res = _call('record_video', wait_s=seconds + 120, seconds=seconds, path=avi)
 	return _dump(_finish_video(res, format, crf, fps, max_size))
@@ -588,6 +670,8 @@ def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None
 
 	Vizard is Y-up, left-handed; euler is [yaw, pitch, roll] in degrees."""
 	_check_video_options(format, crf, fps, max_size)
+	if not dry_run:
+		_require_local_files('record_tour')
 	if (keyframes is None) == (orbit is None and target is None):
 		raise VizardToolError('Give keyframes, or orbit / target to circle around (not both).')
 	if interp not in ('catmull', 'smoothstep', 'linear'):
@@ -607,7 +691,7 @@ def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None
 		            radius=radius, elevation_deg=elevation_deg, degrees=degrees, start_yaw_deg=start_yaw_deg,
 		            duration=duration, interp=interp, dry_run=True, count=n)
 		shots = res['shots']
-		images = [imaging.load(s['path']) for s in shots]
+		images = [_app_image(s['path']) for s in shots]
 		captions = [s['view'].get('label') or 'frame %d' % (i + 1) for i, s in enumerate(shots)]
 		text = '%s over %.2f s (dry run, nothing recorded)\n' % (res.get('path'), res['duration'])
 		text += '\n'.join('%s: camera %s -> %s' % (c, s['view'].get('position'),
@@ -705,6 +789,187 @@ def click_button(label: str | None = None, id: int | None = None, button: str = 
 	if label is None and id is None:
 		raise VizardToolError('Give label or id.')
 	return _dump(_call('click_button', wait_s=40, label=label, id=id, button=button, double=double))
+
+
+# ---------------------------------------------------------------------------
+# GUI smoke test
+# ---------------------------------------------------------------------------
+
+CRAWL_SNAPSHOT = '__crawl_gui__'
+DEFAULT_DENY = 'quit|exit|close|delete'
+_TRACE_HEAD = re.compile(r'^Traceback \(most recent call last\)')
+_EXC_LINE = re.compile(r'^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt)\b')
+
+
+def _clip_text(text, n=1500):
+	return text if len(text) <= n else text[:n] + '... [%d more characters]' % (len(text) - n)
+
+
+def _log_exceptions(lines):
+	"""Python exceptions in get_log lines (dicts with stream and text): a Traceback plus its final
+	"Type: message" line, or a bare exception line on stderr. Returns one string per exception."""
+	found, trace = [], None
+	for ln in lines:
+		text = ln.get('text', '')
+		if ln.get('stream') != 'err':
+			if trace is not None:
+				found.append(trace)
+				trace = None
+			continue
+		if _TRACE_HEAD.match(text):
+			if trace is not None:
+				found.append(trace)
+			trace = text
+		elif trace is not None:
+			trace += '\n' + text
+			if text and not text[0].isspace():          # the exception line ends the traceback
+				found.append(trace)
+				trace = None
+		elif _EXC_LINE.match(text):
+			found.append(text)
+	if trace is not None:
+		found.append(trace)
+	return [_clip_text(f) for f in found]
+
+
+def _crawl_buttons(widgets, label, deny, max_buttons):
+	"""(to_click, skipped): the visible, enabled on-screen buttons that match `label` and do not
+	match `deny`. A button with no text is skipped since the deny list cannot be checked on it."""
+	pick, skipped = [], []
+	for w in widgets:
+		text = w.get('text')
+		if w.get('kind') != 'button' or not w.get('visible'):
+			continue
+		if w.get('enabled') is False or not w.get('on_screen'):
+			skipped.append({'id': w['id'], 'label': text, 'reason': 'disabled or off screen'})
+		elif not text or not text.strip():
+			skipped.append({'id': w['id'], 'label': text, 'reason': 'no text, so the deny list cannot be checked'})
+		elif label is not None and not label.search(text):
+			continue
+		elif deny is not None and deny.search(text):
+			skipped.append({'id': w['id'], 'label': text, 'reason': 'matches the deny pattern'})
+		else:
+			pick.append(w)
+	if len(pick) > max_buttons:
+		skipped += [{'id': w['id'], 'label': w['text'], 'reason': 'over max_buttons'} for w in pick[max_buttons:]]
+		pick = pick[:max_buttons]
+	return pick, skipped
+
+
+def _text_table(columns, rows):
+	cells = [[str(c) for c in columns]] + [[str(c) for c in r] for r in rows]
+	widths = [max(len(r[i]) for r in cells) for i in range(len(columns))]
+	return '\n'.join('  '.join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in cells)
+
+
+@mcp.tool()
+def crawl_gui(label: str | None = None, max_buttons: int = 10, deny: str = DEFAULT_DENY,
+              settle_frames: int = 10, restore: bool = True, nodes: list[str] | None = None,
+              named: bool = False, pattern: str = '', root: str | None = None, max_nodes: int = 2000,
+              state: str | None = None, restore_code: str | None = None, pixel_tolerance: int = 8,
+              change_threshold_pct: float = 0.05, save_dir: str | None = None, html: bool = False) -> str:
+	"""A smoke test of the app's 2D GUI: click every visible, enabled button (from gui_list) one at a
+	time and report what each did. Per button: capture the window, click it (click_button by id), let
+	`settle_frames` frames pass, read the new console lines and Python exceptions (get_log), compare
+	the window with the capture before the click (screenshot_diff), then put the scene back from a
+	snapshot. Returns a table (button, changed %, errors, new log lines), the details per button, and
+	the buttons that were skipped and why. The result can go into make_report (crawl_gui section).
+
+	label: regex (case-insensitive search) that button texts must match; default all buttons.
+	max_buttons: click at most this many, in gui_list order.
+	deny: buttons whose text matches this regex are never clicked (default "quit|exit|close|delete";
+	      pass "" to allow all, at your own risk). Buttons without text are not clicked either.
+	restore: after each click, put back what the snapshot recorded. The snapshot is taken with the
+	      same arguments as snapshot_save (nodes, named, pattern, root, max_nodes, state, restore_code),
+	      so give at least one of nodes / named / root / state; with restore=false nothing is undone.
+	pixel_tolerance: as in screenshot_diff. change_threshold_pct: a click counts as visibly changing
+	      the window when more than this percentage of pixels differ.
+	save_dir: folder for the before / diff images (default: the vizmcp temp folder).
+	html: also return `html_section` for reports.
+	Clicking is the real-mouse click of click_button (the window must be visible); buttons can have any
+	effect in your app, so run this on a scene you can restore."""
+	if max_buttons < 1:
+		raise VizardToolError('max_buttons must be at least 1.')
+	if settle_frames < 0:
+		raise VizardToolError('settle_frames must be 0 or more.')
+	if not 0 <= pixel_tolerance <= 255:
+		raise VizardToolError('pixel_tolerance must be 0..255.')
+	if change_threshold_pct < 0:
+		raise VizardToolError('change_threshold_pct must be 0 or more.')
+	try:
+		label_re = re.compile(label, re.I) if label else None
+		deny_re = re.compile(deny, re.I) if deny else None
+	except re.error as e:
+		raise VizardToolError('Bad regular expression: %s' % e)
+	if restore and not (nodes or named or root is not None or state):
+		raise VizardToolError('restore=true needs something to snapshot: give nodes, named, root or state '
+		                      '(as in snapshot_save), or pass restore=false to click without undoing.')
+	gui = json.loads(gui_list(visible_only=True, kinds=['button']))
+	pick, skipped = _crawl_buttons(gui['widgets'], label_re, deny_re, max_buttons)
+	found = len(pick) + sum(1 for x in skipped if x['reason'] == 'over max_buttons')
+	out_dir = os.path.abspath(save_dir) if save_dir else os.path.join(
+		tempfile.gettempdir(), 'vizmcp', 'crawl_%s' % time.strftime('%Y%m%d_%H%M%S'))
+	os.makedirs(out_dir, exist_ok=True)
+	results = []
+	if pick and restore:
+		snapshot_save(CRAWL_SNAPSHOT, nodes=nodes, named=named, pattern=pattern, root=root,
+		              max_nodes=max_nodes, state=state, restore_code=restore_code)
+	for n, w in enumerate(pick, 1):
+		row = {'id': w['id'], 'label': w['text'], 'clicked': False, 'changed': None, 'changed_pct': None,
+		       'errors': [], 'new_log_lines': 0, 'log': [], 'click_error': None, 'restore': None}
+		results.append(row)
+		before = os.path.join(out_dir, '%02d_before.png' % n)
+		try:
+			screenshot_diff(before, update_reference=True)
+			seq0 = json.loads(get_log(since=0, limit=1))['last_seq']
+			try:
+				_call('click_button', wait_s=40, id=w['id'])
+				row['clicked'] = True
+			except VizardToolError as e:
+				row['click_error'] = str(e)
+			if row['clicked']:
+				if settle_frames:
+					wait(frames=settle_frames)
+				lines = json.loads(get_log(since=seq0, limit=1000))['lines']
+				row['new_log_lines'] = len(lines)
+				row['log'] = [x['text'] for x in lines[:20]]
+				row['errors'] = _log_exceptions(lines)
+				diff = json.loads(screenshot_diff(before, pixel_tolerance=pixel_tolerance,
+				                                  save_diff_to=os.path.join(out_dir, '%02d_diff.png' % n))[1])
+				row['changed_pct'] = diff['diff_pct']
+				row['size_mismatch'] = bool(diff.get('size_mismatch'))
+				row['changed'] = row['size_mismatch'] or diff['diff_pct'] > change_threshold_pct
+		except VizardToolError as e:
+			row['tool_error'] = str(e)
+		if restore:
+			try:
+				r = json.loads(snapshot_restore(CRAWL_SNAPSHOT))
+				row['restore'] = {'restored': r['restored'], 'missing': len(r['missing']),
+				                  'failed': len(r['failed']), 'state': (r.get('state') or {}).get('restored')}
+				wait(frames=max(2, settle_frames // 2))
+			except VizardToolError as e:
+				row['restore'] = {'error': str(e)}
+	columns = ['Button', 'Changed %', 'Changed', 'Errors', 'New log lines']
+	rows = [[r['label'], '-' if r['changed_pct'] is None else r['changed_pct'],
+	         'not clicked' if not r['clicked'] else ('yes' if r['changed'] else 'no'),
+	         len(r['errors']) + (1 if r['click_error'] or r.get('tool_error') else 0), r['new_log_lines']]
+	        for r in results]
+	res = {
+		'summary': {'buttons_found': found, 'clicked': sum(1 for r in results if r['clicked']),
+		            'changed': sum(1 for r in results if r['changed']),
+		            'with_errors': sum(1 for r in results if r['errors'] or r['click_error'] or r.get('tool_error')),
+		            'skipped': len(skipped), 'restore': restore,
+		            'restore_issues': sum(1 for r in results if r['restore'] and (
+		                r['restore'].get('error') or r['restore'].get('missing') or r['restore'].get('failed')))},
+		'table': {'columns': columns, 'rows': rows},
+		'text_table': _text_table(columns, rows),
+		'results': results, 'skipped': skipped, 'output_dir': out_dir,
+		'snapshot': CRAWL_SNAPSHOT if restore and pick else None,
+	}
+	_last['crawl_gui'] = res
+	if html:
+		res = dict(res, html_section='\n'.join(report.crawl_gui_html(res)))
+	return _dump(res)
 
 
 @mcp.tool()
@@ -879,6 +1144,43 @@ def scene_stats(top: int = 10) -> str:
 
 
 @mcp.tool()
+def asset_check(top: int = 15, max_size_m: float = 1000.0, min_size_m: float = 0.001,
+                sibling_ratio: float = 100.0, duplicate_min_primitives: int = 1000,
+                texture_hog_mb: float = 32.0, max_nodes: int = 5000, check_files: bool = True,
+                html: bool = False) -> str:
+	"""Audit the scene's assets. Returns scene totals (primitives, vertices, drawables, textures,
+	texture memory; from viz.MainScene.getStats()) and, from the per-node getStats:
+	top_nodes: the `top` nodes by their own primitives (a group's figure excludes its children), with
+	  size, script names and file if the node reports one.
+	size_outliers: nodes whose bounding box is over max_size_m or under min_size_m on its longest side, or
+	  sibling_ratio times larger (or smaller) than the median of their siblings; typically a model
+	  exported in the wrong unit (a GLB in millimetres or centimetres).
+	empty_nodes: nodes with nothing to draw (lights, sounds and views excepted); hidden_costly: hidden
+	  nodes that still hold primitives; duplicates: subtrees of at least duplicate_min_primitives that
+	  occur more than once (same file, else identical statistics) and the primitives they waste;
+	  texture_hogs: nodes by their own texture memory, flagged from texture_hog_mb; files: file names
+	  found (getFilename / getName; null where a node has none) and the ones missing on disk.
+	html: also return `html_section`, a fragment for reports (make_report has an asset_check section).
+	Only the figures this Vizard provides are filled in; notes say what was unavailable."""
+	for name, value in (('top', top), ('duplicate_min_primitives', duplicate_min_primitives)):
+		if value < 0:
+			raise VizardToolError('%s must be 0 or more.' % name)
+	for name, value in (('max_size_m', max_size_m), ('min_size_m', min_size_m), ('sibling_ratio', sibling_ratio),
+	                    ('texture_hog_mb', texture_hog_mb)):
+		if not value > 0:
+			raise VizardToolError('%s must be above 0.' % name)
+	if max_nodes < 1:
+		raise VizardToolError('max_nodes must be at least 1.')
+	res = _call('asset_check', wait_s=120, top=top, max_size_m=max_size_m, min_size_m=min_size_m,
+	            sibling_ratio=sibling_ratio, duplicate_min_primitives=duplicate_min_primitives,
+	            texture_hog_mb=texture_hog_mb, max_nodes=max_nodes, check_files=check_files)
+	_last['asset_check'] = res
+	if html:
+		res = dict(res, html_section='\n'.join(report.asset_check_html(res, top or 15)))
+	return _dump(res)
+
+
+@mcp.tool()
 def profile(frames: int = 120, top: int = 25, sort: str = 'self') -> str:
 	"""Profile all Python code that runs on the app's main thread for `frames` frames.
 	Returns frame time (mean, p95, max), FPS, Python milliseconds per frame, and the top
@@ -980,6 +1282,8 @@ _REPORT_KEYS = {
 	'screenshot': (set(), {'annotate', 'label_limit', 'caption'}),
 	'image': ({'path'}, {'caption'}),
 	'keyvalue': ({'items'}, {'caption'}),
+	'asset_check': (set(), {'result', 'top', 'caption'}),
+	'crawl_gui': (set(), {'result', 'caption'}),
 }
 _REPORT_ALIASES = {'table': 'keyvalue', 'kv': 'keyvalue', 'paragraph': 'text', 'markdown': 'text'}
 
@@ -1007,6 +1311,10 @@ def _check_report_sections(sections):
 				where, kind, ', '.join(extra), ', '.join(sorted(need | may)) or 'nothing else'))
 		if kind == 'image' and not os.path.isfile(sec['path']):
 			raise VizardToolError('%s (image): no such file: %s' % (where, sec['path']))
+		if 'result' in sec and not isinstance(sec['result'], dict):
+			raise VizardToolError('%s (%s): result must be the object the %s tool returned.' % (where, kind, kind))
+		if kind == 'crawl_gui' and 'result' not in sec and 'crawl_gui' not in _last:
+			raise VizardToolError('%s (crawl_gui): run the crawl_gui tool first, or pass its result.' % where)
 		if kind == 'keyvalue':
 			items = sec['items']
 			if not (isinstance(items, dict) or (isinstance(items, list) and all(
@@ -1086,6 +1394,18 @@ def _report_screenshot(sec, max_size):
 	                      sec.get('caption') or 'Screenshot of the Vizard window', 'Screenshot')], None
 
 
+def _report_asset_check(sec, max_size):
+	res = sec.get('result') or json.loads(asset_check())
+	title = sec.get('caption')
+	return ([report.markdown(title)] if title else []) + report.asset_check_html(res, int(sec.get('top', 15))), None
+
+
+def _report_crawl_gui(sec, max_size):
+	res = sec.get('result') or _last['crawl_gui']
+	title = sec.get('caption')
+	return ([report.markdown(title)] if title else []) + report.crawl_gui_html(res), None
+
+
 def _report_image(sec, max_size):
 	try:
 		im = imaging.load(sec['path'])
@@ -1119,6 +1439,10 @@ def make_report(sections: list[dict[str, Any]], path: str | None = None, title: 
 	        tolerance), error statistics and the measured-vs-theory chart.
 	  {"type": "screenshot", "annotate": false, "caption": "..."}   the Vizard window as it is now.
 	  {"type": "image", "path": "C:/out/photo.png", "caption": "..."}   an existing PNG or JPEG.
+	  {"type": "asset_check", "result": {...}, "top": 15, "caption": "..."}   the asset_check tool's tables
+	        (runs it now unless `result`, an earlier asset_check result, is given).
+	  {"type": "crawl_gui", "result": {...}, "caption": "..."}   the latest crawl_gui result of this server
+	        (or the `result` you pass); a crawl clicks buttons, so a report never starts one.
 	  {"type": "keyvalue", "items": {"Load": "1 kN", "Span": "2 m"}, "caption": "..."}   a two-column
 	        table; items may also be a list of [key, value] pairs. ("table" is accepted too.)
 	The arguments of every section are checked before anything is taken from the app; a section
@@ -1129,7 +1453,7 @@ def make_report(sections: list[dict[str, Any]], path: str | None = None, title: 
 	if max_image_size < 16:
 		raise VizardToolError('max_image_size must be at least 16 pixels.')
 	builders = {'watch': _report_watch, 'validate': _report_validate, 'screenshot': _report_screenshot,
-	            'image': _report_image}
+	            'image': _report_image, 'asset_check': _report_asset_check, 'crawl_gui': _report_crawl_gui}
 	body, results, images = [], [], 0
 	for i, sec in enumerate(sections, 1):
 		kind = sec['type']
@@ -1168,7 +1492,8 @@ def doctor() -> str:
 	"""Check the vizard-mcp installation and print PASS / WARN / FAIL lines with a fix for each:
 	Python, mcp and Pillow versions, winviz.exe and the Vizard folder, the vizmcp port, ffmpeg
 	for MP4 videos, and whether the server is registered in Claude Code and Claude Desktop with a
-	command path that exists. Local checks only; nothing is sent over the network."""
+	command path that exists. The only network traffic is one ping to the configured target
+	(VIZMCP_HOST:VIZMCP_PORT); for a remote host the report says whether it answers."""
 	return doctor_mod.render(doctor_mod.run_checks())
 
 

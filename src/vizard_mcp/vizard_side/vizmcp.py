@@ -11,7 +11,8 @@ or launch an unmodified script through the bootstrap:
     winviz.exe vizmcp_boot.py  (with VIZMCP_TARGET=path\\to\\script.py)
 
 The module opens a TCP socket on 127.0.0.1 (port 9877 by default) and speaks
-newline-delimited JSON:
+newline-delimited JSON. It listens on another interface only when VIZMCP_BIND (or the host
+argument of start) asks for one, and then it refuses to start without a token (VIZMCP_TOKEN):
 
     -> {"id": 1, "cmd": "scene_tree", "params": {"depth": 2}}
     <- {"id": 1, "ok": true, "result": {...}}
@@ -33,8 +34,11 @@ import collections
 import copy
 import cProfile
 import csv
+import base64
+import hmac
 import importlib
 import inspect
+import ipaddress
 import io
 import json
 import math
@@ -56,6 +60,7 @@ import vizact
 __version__ = '1.0.0'
 
 DEFAULT_PORT = 9877
+DEFAULT_BIND = '127.0.0.1'
 _PUMP_PRIORITY = viz.PRIORITY_LAST_UPDATE + 1000   # after app logic and vizconnect
 _HOLD_PRIORITY = _PUMP_PRIORITY - 1
 _PUMP_BUDGET_S = 0.025                              # max main-thread time per frame for new commands
@@ -358,6 +363,7 @@ def cmd_info(p):
 		'vizconnect': 'vizconnect' in sys.modules,
 		'watches': {n: w.status() for n, w in _State.watches.items()},
 		'recording': _State.recording['path'] if _State.recording else None,
+		'listening': '%s:%d' % (_server.host, _server.port) if _server is not None else None,
 		'commands': sorted(COMMANDS),
 	}
 
@@ -606,6 +612,25 @@ def _capture(path=None):
 				        'time_s': round(viz.getFrameTime(), 3),
 				        'window_size': _jsonable(viz.window.getSize())}
 			last = size
+
+
+_FETCH_TYPES = ('.png', '.jpg', '.jpeg')
+_FETCH_MAX = 32 * 1024 * 1024
+
+
+def cmd_fetch_file(p):
+	"""An image file this app wrote (screenshot, view) as base64, for a server on another PC that
+	cannot read this PC's disk. Images only, so this is not a general file reader."""
+	path = os.path.abspath(str(p.get('path') or ''))
+	if os.path.splitext(path)[1].lower() not in _FETCH_TYPES:
+		raise ValueError('fetch_file only sends %s files' % '/'.join(_FETCH_TYPES))
+	if not os.path.isfile(path):
+		raise ValueError('no such file on the app PC: %s' % path)
+	size = os.path.getsize(path)
+	if size > _FETCH_MAX:
+		raise ValueError('%s is %d bytes; the limit is %d' % (path, size, _FETCH_MAX))
+	with open(path, 'rb') as f:
+		return {'path': path, 'bytes': size, 'data': base64.b64encode(f.read()).decode('ascii')}
 
 
 def cmd_screenshot(p):
@@ -1659,6 +1684,298 @@ def cmd_scene_stats(p):
 		               'triangles': c['triangles'], 'subnodes': c['subnodes']} for c in heavy],
 		'notes': notes,
 		**extra,
+	}
+
+
+# ---------------------------------------------------------------------------
+# Asset check: what makes a scene heavy or wrong (scale bugs, hidden cost, duplicates)
+# ---------------------------------------------------------------------------
+
+_FILE_ACCESSORS = ('getFilename', 'getFileName')
+_NAME_ACCESSORS = ('getName',)
+_NO_GEOMETRY_TYPES = ('light', 'sound', 'view', 'camera', 'link', 'avatar', 'effect')
+_MIB = 1024.0 * 1024.0
+
+
+def _looks_like_path(text):
+	"""A name that is plausibly a file: a separator, or a short extension after a dot."""
+	if not isinstance(text, str) or not text.strip() or '\n' in text:
+		return False
+	if '/' in text or '\\' in text:
+		return True
+	ext = os.path.splitext(text)[1]
+	return 1 < len(ext) <= 6 and ' ' not in text
+
+
+def _probe_file(node):
+	"""(file, name): the file a node was loaded from and its name, each None when the node has
+	no such accessor, it fails, or it gives nothing usable. getName is only taken as a file
+	when it looks like a path."""
+	file_, _ = _try_accessors(node, _FILE_ACCESSORS)
+	name, _ = _try_accessors(node, _NAME_ACCESSORS)
+	name = name if isinstance(name, str) and name.strip() else None
+	file_ = file_ if isinstance(file_, str) and file_.strip() else None
+	if file_ is None and _looks_like_path(name):
+		file_ = name
+	return file_, name
+
+
+def _file_exists(path, folders):
+	"""(exists, certain): an absolute path is checked as it is; a relative one in each folder
+	(the working directory and the script's), and a miss there is not certain because Vizard
+	also searches its own resource paths."""
+	if os.path.isabs(path):
+		return os.path.exists(path), True
+	return any(os.path.exists(os.path.join(f, path)) for f in folders if f), False
+
+
+def _extent(size):
+	try:
+		vals = [abs(float(v)) for v in size]
+	except (TypeError, ValueError):
+		return None
+	return max(vals) if vals else None
+
+
+def _median(values):
+	v = sorted(values)
+	n = len(v)
+	if not n:
+		return None
+	return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _asset_flags(extent, has_geometry, siblings_extents, huge_m, tiny_m, ratio):
+	flags = []
+	if extent is None or not has_geometry:
+		return flags
+	if extent > huge_m:
+		flags.append('huge')
+	elif 0 < extent < tiny_m:
+		flags.append('tiny')
+	others = [e for e in siblings_extents if e and e > 0]
+	if len(others) >= 2 and extent > 0:
+		med = _median(others)
+		if med and extent > ratio * med:
+			flags.append('larger_than_siblings')
+		elif med and extent * ratio < med:
+			flags.append('smaller_than_siblings')
+	return flags
+
+
+def _stat_tuple(st):
+	if st is None:
+		return None
+	try:
+		return {'vertices': int(st.vertexCount), 'primitives': int(st.primitiveCount),
+		        'drawables': int(st.drawableCount), 'transforms': int(getattr(st, 'transformCount', 0)),
+		        'nodes': int(getattr(st, 'nodeCount', 0)), 'textures': int(st.textureCount),
+		        'texture_bytes': int(st.textureBytes)}
+	except (TypeError, ValueError, AttributeError):
+		return None
+
+
+def _asset_node_row(info, labels):
+	node = info['node']
+	row = {'id': node.id, 'type': type(node).__name__, 'names': labels.get(node.id, []),
+	       'visible': info['visible'], 'file': info['file'], 'name': info['name']}
+	st = info['stats']
+	row.update(primitives=st['primitives'], own_primitives=info['own_primitives'], vertices=st['vertices'],
+	           drawables=st['drawables'], textures=st['textures'], texture_bytes=st['texture_bytes'],
+	           own_texture_bytes=info['own_texture_bytes'], size=info['size'], flags=list(info['flags']))
+	return row
+
+
+def cmd_asset_check(p):
+	"""Per-node cost, scale outliers, empty and hidden-but-costly nodes, duplicated heavy subtrees,
+	texture memory and missing files; totals come from viz.MainScene.getStats()."""
+	top = max(0, int(p.get('top', 15)))
+	huge_m = float(p.get('max_size_m', 1000.0))
+	tiny_m = float(p.get('min_size_m', 0.001))
+	ratio = float(p.get('sibling_ratio', 100.0))
+	dup_min = int(p.get('duplicate_min_primitives', 1000))
+	hog_bytes = float(p.get('texture_hog_mb', 32.0)) * _MIB
+	limit = max(1, int(p.get('max_nodes', 5000)))
+	check_files = bool(p.get('check_files', True))
+	notes = []
+
+	all_nodes = [n for n in viz.getNodeList() if n.valid()]
+	truncated = len(all_nodes) > limit
+	if truncated:
+		notes.append('only the first %d of %d nodes were analysed (max_nodes)' % (limit, len(all_nodes)))
+	infos = {}
+	no_stats = 0
+	for n in all_nodes[:limit]:
+		if _SCREEN_TYPES and isinstance(n, _SCREEN_TYPES):
+			continue                                # 2D GUI: coordinates are window fractions, not metres
+		st = _stat_tuple(_stats(n))
+		if st is None:
+			no_stats += 1
+			continue
+		file_, name = _probe_file(n)
+		infos[n.id] = {'node': n, 'stats': st, 'file': file_, 'name': name, 'visible': bool(n.getVisible()),
+		               'size': None, 'extent': None, 'flags': [], 'parent': None}
+	if no_stats:
+		notes.append('%d nodes have no getStats and were skipped' % no_stats)
+	if not infos:
+		notes.append('no node reported getStats; this needs Vizard 8')
+
+	# Parent links and own cost (subtree minus children; clamped because instanced children overlap).
+	children_of = collections.defaultdict(list)
+	for nid, info in infos.items():
+		try:
+			parents = info['node'].getParents()
+		except Exception:
+			parents = []
+		info['parents'] = [q.id for q in parents]
+		for q in parents:
+			children_of[q.id].append(nid)
+		info['parent'] = parents[0].id if parents else None
+	for nid, info in infos.items():
+		kids = [infos[c] for c in children_of.get(nid, []) if c in infos]
+		info['own_primitives'] = max(0, info['stats']['primitives'] - sum(k['stats']['primitives'] for k in kids))
+		info['own_texture_bytes'] = max(0, info['stats']['texture_bytes'] - sum(k['stats']['texture_bytes'] for k in kids))
+		info['own_drawables'] = max(0, info['stats']['drawables'] - sum(k['stats']['drawables'] for k in kids))
+
+	# Size outliers.
+	for nid, info in infos.items():
+		bb = _bbox(info['node'])
+		if bb:
+			info['size'] = bb['size']
+			info['extent'] = _extent(bb['size'])
+	by_parent = collections.defaultdict(list)
+	for nid, info in infos.items():
+		if info['extent'] is not None:
+			by_parent[info['parent']].append(nid)
+	for nid, info in infos.items():
+		has_geo = info['stats']['drawables'] > 0
+		sib = [infos[o]['extent'] for o in by_parent.get(info['parent'], []) if o != nid]
+		info['flags'] = _asset_flags(info['extent'], has_geo, sib, huge_m, tiny_m, ratio)
+
+	labels = _labels() if infos else {}
+	ranked = sorted(infos.values(), key=lambda i: (i['own_primitives'], i['stats']['primitives']), reverse=True)
+	top_nodes = [_asset_node_row(i, labels) for i in ranked[:top]]
+	outliers = [_asset_node_row(i, labels) for i in infos.values() if i['flags']]
+	outliers.sort(key=lambda r: r['own_primitives'], reverse=True)
+
+	# Nodes with nothing to draw (lights, sounds, views and the like are expected to be empty).
+	empty = [i for i in infos.values() if i['stats']['drawables'] == 0
+	         and not any(t in type(i['node']).__name__.lower() for t in _NO_GEOMETRY_TYPES)]
+	empty_ids = set(i['node'].id for i in empty)
+	empty_top = [i for i in empty if i['parent'] not in empty_ids]     # an empty subtree is listed once, at its top
+	empty_rows = [_asset_node_row(i, labels) for i in empty_top[:max(top, 25)]]
+
+	# Hidden nodes that still hold geometry (topmost hidden node of each hidden subtree).
+	costs = [{'node': i['node'], 'visible': i['visible'], 'triangles': i['stats']['primitives']} for i in infos.values()]
+	roots = _hidden_roots(costs)
+	if roots is None:
+		notes.append('parents could not be read: hidden nodes were not rolled up to their topmost hidden node')
+		roots = [c for c in costs if not c['visible']]
+	hidden = [infos[c['node'].id] for c in roots if c['triangles'] > 0]
+	hidden.sort(key=lambda i: i['stats']['primitives'], reverse=True)
+	hidden_rows = [_asset_node_row(i, labels) for i in hidden[:max(top, 25)]]
+
+	# Duplicate heavy subtrees: same file, or identical statistics, at least dup_min primitives.
+	groups = collections.defaultdict(list)
+	for nid, info in infos.items():
+		st = info['stats']
+		if st['primitives'] < dup_min:
+			continue
+		sig = (st['primitives'], st['vertices'], st['drawables'], st['textures'], st['texture_bytes'], st['nodes'])
+		groups[sig].append(info)
+	duplicates = []
+	for sig, members in groups.items():
+		ids = set(m['node'].id for m in members)
+		members = [m for m in members if m['parent'] not in ids]       # a wrapper around its twin is not a copy
+		if len(members) < 2:
+			continue
+		files = set(m['file'] for m in members if m['file'])
+		prim = members[0]['stats']['primitives']
+		duplicates.append({'primitives_each': prim, 'copies': len(members),
+		                   'wasted_primitives': prim * (len(members) - 1),
+		                   'wasted_texture_bytes': members[0]['stats']['texture_bytes'] * (len(members) - 1),
+		                   'basis': 'same file' if len(files) == 1 and all(m['file'] for m in members)
+		                   else 'identical statistics',
+		                   'nodes': [{'id': m['node'].id, 'names': labels.get(m['node'].id, []), 'file': m['file']}
+		                             for m in members[:12]]})
+	duplicates.sort(key=lambda d: d['wasted_primitives'], reverse=True)
+
+	# Texture memory.
+	scene = _stat_tuple(_stats(getattr(viz, 'MainScene', None)))
+	if scene is not None:
+		totals = dict(scene, source='viz.MainScene.getStats()')
+	else:
+		roots_ = [i for i in infos.values() if not any(q in infos for q in i['parents'])]
+		totals = {'vertices': sum(i['stats']['vertices'] for i in roots_),
+		          'primitives': sum(i['stats']['primitives'] for i in roots_),
+		          'drawables': sum(i['stats']['drawables'] for i in roots_),
+		          'textures': sum(i['stats']['textures'] for i in roots_),
+		          'texture_bytes': sum(i['stats']['texture_bytes'] for i in roots_),
+		          'source': 'sum over top-level nodes (viz.MainScene.getStats is missing)'}
+		notes.append('totals are summed over top-level nodes: ' + totals['source'])
+	totals['texture_mb'] = round(totals['texture_bytes'] / _MIB, 2)
+	totals['nodes'] = len(all_nodes)
+	tex_total = totals['texture_bytes']
+	hogs = []
+	for i in sorted(infos.values(), key=lambda i: i['own_texture_bytes'], reverse=True)[:max(top, 10)]:
+		if i['own_texture_bytes'] <= 0:
+			break
+		row = _asset_node_row(i, labels)
+		row['texture_mb'] = round(i['own_texture_bytes'] / _MIB, 2)
+		row['share_of_texture_memory_pct'] = round(100.0 * i['own_texture_bytes'] / tex_total, 1) if tex_total else None
+		row['flagged'] = i['own_texture_bytes'] >= hog_bytes
+		hogs.append(row)
+
+	# Files on disk.
+	missing = []
+	files_checked = 0
+	if check_files:
+		folders = [os.getcwd(), os.path.dirname(os.path.abspath(getattr(sys.modules['__main__'], '__file__', '') or '')) or None]
+		seen = set()
+		for i in infos.values():
+			f = i['file']
+			if not f or f in seen:
+				continue
+			seen.add(f)
+			files_checked += 1
+			ok, certain = _file_exists(f, folders)
+			if not ok:
+				missing.append({'file': f, 'id': i['node'].id, 'names': labels.get(i['node'].id, []),
+				                'certain': certain})
+		if missing and not all(m['certain'] for m in missing):
+			notes.append('relative paths are looked up in the working and script folders only; Vizard also '
+			             'searches its own resource paths, so those misses are marked certain=false')
+	if not any(i['file'] for i in infos.values()):
+		notes.append('no node reported a file name (getFilename / getName), so duplicates are judged by '
+		             'statistics and missing files cannot be checked')
+
+	findings = []
+	if outliers:
+		findings.append('%d node(s) with a suspicious size (huge, tiny, or far from their siblings): likely a '
+		                'unit or scale problem in the model' % len(outliers))
+	if empty_top:
+		findings.append('%d node(s) with nothing to draw' % len(empty_top))
+	if hidden:
+		findings.append('%d hidden node(s) still hold %d primitives' % (len(hidden), sum(i['stats']['primitives'] for i in hidden)))
+	if duplicates:
+		findings.append('%d duplicated heavy subtree(s) waste %d primitives' % (
+			len(duplicates), sum(d['wasted_primitives'] for d in duplicates)))
+	flagged = [h for h in hogs if h['flagged']]
+	if flagged:
+		findings.append('%d node(s) hold at least %g MB of textures each' % (len(flagged), hog_bytes / _MIB))
+	if missing:
+		findings.append('%d file(s) not found on disk' % len(missing))
+	return {
+		'totals': totals, 'nodes_analysed': len(infos), 'truncated': truncated,
+		'top_nodes': top_nodes, 'size_outliers': outliers[:max(top, 25)],
+		'empty_nodes': {'count': len(empty_top), 'nodes': empty_rows},
+		'hidden_costly': {'count': len(hidden), 'primitives': sum(i['stats']['primitives'] for i in hidden),
+		                  'nodes': hidden_rows},
+		'duplicates': duplicates[:max(top, 10)], 'texture_hogs': hogs,
+		'files': {'checked': files_checked, 'missing': missing},
+		'thresholds': {'max_size_m': huge_m, 'min_size_m': tiny_m, 'sibling_ratio': ratio,
+		               'duplicate_min_primitives': dup_min, 'texture_hog_mb': hog_bytes / _MIB},
+		'findings': findings, 'notes': notes,
 	}
 
 
@@ -2771,6 +3088,7 @@ COMMANDS = {
 	'get_log': cmd_get_log,
 	'reload_module': cmd_reload_module,
 	'screenshot': cmd_screenshot,
+	'fetch_file': cmd_fetch_file,
 	'multi_view': cmd_multi_view,
 	'filmstrip': cmd_filmstrip,
 	'record_video': cmd_record_video,
@@ -2790,6 +3108,7 @@ COMMANDS = {
 	'watch_list': cmd_watch_list,
 	'watch_export': cmd_watch_export,
 	'scene_stats': cmd_scene_stats,
+	'asset_check': cmd_asset_check,
 	'profile': cmd_profile,
 	'vizconnect_info': cmd_vizconnect_info,
 	'gui_list': cmd_gui_list,
@@ -2960,7 +3279,8 @@ class _Server(object):
 		except ValueError as e:
 			return {'id': None, 'ok': False, 'error': 'bad JSON: %s' % e}
 		rid = req.get('id')
-		if self.token and req.get('token') != self.token:
+		if self.token and not (isinstance(req.get('token'), str)
+		                       and hmac.compare_digest(req['token'].encode('utf-8'), self.token.encode('utf-8'))):
 			return {'id': rid, 'ok': False, 'error': 'bad or missing token'}
 		job = _Job(req.get('cmd'), req.get('params'))
 		_jobs.put(job)
@@ -2974,14 +3294,34 @@ _server = None
 _pump_event = None
 
 
-def start(port=None, host='127.0.0.1', token=None, quiet=False):
-	"""Start the vizmcp server. Safe to call more than once."""
+def _is_loopback(host):
+	host = (host or '').strip().strip('[]').lower()
+	if host == 'localhost':
+		return True
+	try:
+		return ipaddress.ip_address(host).is_loopback
+	except ValueError:
+		return False
+
+
+def start(port=None, host=None, token=None, quiet=False):
+	"""Start the vizmcp server. Safe to call more than once.
+
+	host: the interface to listen on; default VIZMCP_BIND, else 127.0.0.1 (this PC only). Any
+	other address (a LAN address, 0.0.0.0, a name) exposes run_code to that network, so it is
+	refused unless a token is set (token argument or VIZMCP_TOKEN)."""
 	global _server, _pump_event
 	if _server is not None:
 		return _server.port
 	port = int(port or os.environ.get('VIZMCP_PORT', DEFAULT_PORT))
+	host = (host or os.environ.get('VIZMCP_BIND') or DEFAULT_BIND).strip()
 	token = token or os.environ.get('VIZMCP_TOKEN') or None
 	_install_tee()
+	if not _is_loopback(host) and not token:
+		print('[vizmcp] NOT listening on %s:%d: that address is reachable from other machines and '
+		      'vizmcp can run any Python in this app. Set VIZMCP_TOKEN (the same value on the server '
+		      'side) to allow it, or remove VIZMCP_BIND to listen on 127.0.0.1 only.' % (host, port))
+		return None
 	_server = _Server(host, port, token)
 	try:
 		_server.start()
@@ -2992,7 +3332,8 @@ def start(port=None, host='127.0.0.1', token=None, quiet=False):
 	_pump_event = vizact.onupdate(_PUMP_PRIORITY, _pump)
 	vizact.onexit(stop)
 	if not quiet:
-		print('[vizmcp] %s listening on %s:%d' % (__version__, host, port))
+		print('[vizmcp] %s listening on %s:%d%s' % (__version__, host, port, '' if _is_loopback(host)
+		      else ' (network; token required)'))
 	return port
 
 
