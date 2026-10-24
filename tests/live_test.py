@@ -34,6 +34,20 @@ def j(s):
 	return json.loads(s)
 
 
+def info(name, detail=''):
+	print('INFO %s %s' % (name, str(detail)[:300]))
+
+
+def button_center():
+	"""Where the demo's Reset button is: centre as 0..1 from the top-left of the window,
+	asked of the app itself (Vizard's 2D coordinates have their origin bottom-left)."""
+	rc = j(S.run_code('r = reset_button.getRect(viz.WINDOW_NORMALIZED)\n'
+	                  '[r[0] + r[2] / 2.0, 1.0 - (r[1] + r[3] / 2.0)]'))
+	if rc.get('error'):
+		return None, rc['error'].strip().splitlines()[-1]
+	return json.loads(rc['value'].replace("'", '"')), None
+
+
 def save(img, name):
 	with open(os.path.join(OUT, name), 'wb') as f:
 		f.write(img.data)
@@ -150,12 +164,87 @@ try:
 
 	drops = int(j(S.run_code('drop.drops'))['value'])
 	try:
-		ck = j(S.click(x=0.1, y=0.08))
-		S.wait(frames=5)
-		drops2 = int(j(S.run_code('drop.drops'))['value'])
-		check('click GUI button', drops2 == drops + 1, '%s -> %s %s' % (drops, drops2, ck))
+		size = j(S.vizard_status())['window_size']
+		center, why = button_center()
+		if center is None:
+			# getRect is not available on this Vizard: sweep the top-left of the window instead.
+			info('button rect unavailable, scanning for the button', why)
+			targets = [[fx, fy] for fy in (0.04, 0.08, 0.12, 0.16) for fx in (0.04, 0.08, 0.12, 0.16, 0.2)]
+		else:
+			targets = [center]
+		ck = None
+		for x, y in targets:
+			ck = j(S.click(x=x, y=y))
+			S.wait(frames=5)
+			drops2 = int(j(S.run_code('drop.drops'))['value'])
+			if drops2 != drops:
+				break
+		check('click GUI button', drops2 == drops + 1,
+		      'window %s, button at (%.3f, %.3f) -> pixel %s of %s; %s -> %s' % (
+			      size, x, y, ck['client_pixel'], ck['client_size'], drops, drops2))
+		check('click reports foreground state', 'was_foreground' in ck, ck)
 	except RuntimeError as e:
 		check('click GUI button', False, e)
+	try:
+		S.click(x=1.5, y=0.5)
+		check('click rejects x outside 0..1', False)
+	except RuntimeError as e:
+		check('click rejects x outside 0..1', '0..1' in str(e), e)
+
+	# --- reporting and regression tools --------------------------------------
+	exp_csv = os.path.join(OUT, 'bounce_export.csv')
+	ex = j(S.watch_export('bounce', exp_csv))
+	check('watch_export csv', ex['format'] == 'csv' and ex['rows'] == len(rows) and os.path.getsize(exp_csv) > 100, ex)
+	with open(exp_csv) as f:
+		exp_rows = list(csv.reader(f))
+	check('watch_export csv matches the recorded data',
+	      exp_rows[0] == ['t', 'frame', 'h', 'v', 'pos.x', 'pos.y', 'pos.z']
+	      and [float(c) for c in exp_rows[1]] == rows[0] and len(exp_rows) == len(rows) + 1, exp_rows[:2])
+	exp_json = os.path.join(OUT, 'bounce_export.json')
+	ex = j(S.watch_export('bounce', exp_json, columns=['t', 'h']))
+	with open(exp_json) as f:
+		doc = json.load(f)
+	check('watch_export json + column subset', doc['columns'] == ['t', 'h'] and len(doc['rows']) == len(rows)
+	      and doc['rows'][0] == [rows[0][0], rows[0][2]] and doc['expressions']['h'] == 'drop.height', doc['columns'])
+	try:
+		S.watch_export('bounce', exp_csv, columns=['nope'])
+		check('watch_export unknown column raises', False)
+	except RuntimeError as e:
+		check('watch_export unknown column raises', 'unknown columns' in str(e), e)
+
+	# screenshot_diff: freeze the scene so two captures should match, then change it.
+	S.run_code('table.running = False\ndrop.update = lambda dt: None')
+	S.wait(frames=10)
+	ref_png = os.path.join(OUT, 'diff_reference.png')
+	S.screenshot_diff(ref_png, update_reference=True)
+	check('screenshot_diff writes the reference', os.path.getsize(ref_png) > 1000)
+	same = S.screenshot_diff(ref_png, threshold_pct=0.5, save_diff_to=os.path.join(OUT, 'diff_same.png'))
+	same_j = j(same[1])
+	check('screenshot_diff: unchanged scene passes', same_j['passed'], same_j)
+	S.set_node('beam', visible=False)
+	S.wait(frames=5)
+	changed = S.screenshot_diff(ref_png, threshold_pct=0.5, save_diff_to=os.path.join(OUT, 'diff_changed.png'))
+	save(changed[0], 'diff_changed.jpg')
+	ch_j = j(changed[1])
+	check('screenshot_diff: hidden beam fails and is boxed',
+	      ch_j['passed'] is False and ch_j['diff_pct'] > 0.5 and ch_j['bbox'] is not None, ch_j)
+	S.set_node('beam', visible=True)
+	S.run_code('del drop.update\ntable.running = True')
+
+	n_total = int(j(S.run_code('len(viz.getNodeList())'))['value'])
+	st1 = j(S.scene_stats(top=5))
+	check('scene_stats node count matches Vizard', st1['nodes'] == n_total and 0 < st1['visible_nodes'] <= n_total, st1['nodes'])
+	check('scene_stats top nodes', 0 < len(st1['top_nodes']) <= 5 and all('id' in n for n in st1['top_nodes']), st1['top_nodes'])
+	S.set_node('label', visible=False)
+	st2 = j(S.scene_stats(top=0))
+	check('scene_stats sees a hidden node', st2['visible_nodes'] < st1['visible_nodes'] and st2['top_nodes'] == [],
+	      (st1['visible_nodes'], st2['visible_nodes']))
+	S.set_node('label', visible=True)
+	info('scene_stats triangles/textures/lights', {k: st1[k] for k in ('triangles', 'triangles_visible', 'textures', 'lights', 'ranked_by')})
+	info('scene_stats notes', st1['notes'])
+	# Triangle, texture and light accessors are probed by name; list what this Vizard really has.
+	for q in ('triangle', 'getTexture', 'light'):
+		info('vizard_api %r' % q, S.vizard_api(q, limit=8).replace('\n', ' | '))
 
 	cam = j(S.camera(position=[0, 6, -9], look_at=[0, 1, 0], hold=True))
 	check('camera hold', abs(cam['position'][1] - 6) < 1e-4 and cam['held'], cam)

@@ -868,9 +868,21 @@ def cmd_send_key(p):
 	return {'key': _jsonable(key), 'frames': viz.getFrameNumber() - f0}
 
 
+def _client_pixel(x, y, width, height):
+	"""0..1 (origin top-left) -> pixel inside a client area of width x height."""
+	x, y = float(x), float(y)
+	if not (-1e-6 <= x <= 1 + 1e-6 and -1e-6 <= y <= 1 + 1e-6):
+		raise ValueError('x and y must be 0..1 from the top-left of the window, got (%s, %s)' % (x, y))
+	if width < 1 or height < 1:
+		raise RuntimeError('the Vizard window has no client area (minimised?)')
+	return (min(width - 1, max(0, int(round(x * (width - 1))))),
+	        min(height - 1, max(0, int(round(y * (height - 1))))))
+
+
 def cmd_click(p):
-	"""Click with the real OS mouse at x, y (0..1 from the top-left of the window).
-	Refuses if another window covers that point, and puts the cursor back after."""
+	"""Click with the real OS mouse at x, y (0..1 of the window's client area, from the
+	top-left). Brings the window to the foreground if it is not there already, refuses if
+	another window covers that point, and puts the cursor back after."""
 	import ctypes
 	from ctypes import wintypes
 	user32 = ctypes.windll.user32
@@ -878,29 +890,52 @@ def cmd_click(p):
 	user32.WindowFromPoint.restype = wintypes.HWND
 	user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
 	user32.GetAncestor.restype = wintypes.HWND
+	user32.GetForegroundWindow.restype = wintypes.HWND
 	user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 	user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 	user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+	user32.IsIconic.argtypes = [wintypes.HWND]
+	user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 
 	flags = {'left': (0x0002, 0x0004), 'right': (0x0008, 0x0010), 'middle': (0x0020, 0x0040)}
 	button = p.get('button', 'left')
 	if button not in flags:
 		raise ValueError('button must be left, right or middle')
 	down, up = flags[button]
+	_client_pixel(p['x'], p['y'], 2, 2)     # reject bad coordinates before touching the window
 	hwnd = wintypes.HWND(viz.window.getHandle())
+	root = user32.GetAncestor(hwnd, 2)      # GA_ROOT
+
+	was_foreground = user32.GetForegroundWindow() == root
+	if not was_foreground:
+		if user32.IsIconic(root):
+			user32.ShowWindow(root, 9)      # SW_RESTORE
+		user32.SetForegroundWindow(root)
+		for attempt in range(2):
+			for _ in range(30):
+				if user32.GetForegroundWindow() == root:
+					break
+				yield
+			if user32.GetForegroundWindow() == root or attempt:
+				break
+			# Windows can refuse a focus change from a background process; a tap on Alt lifts that.
+			user32.keybd_event(0x12, 0, 0, 0)
+			user32.keybd_event(0x12, 0, 2, 0)
+			user32.SetForegroundWindow(root)
+	yield from _wait_frames(2)              # let the window settle at its (possibly new) size
+
 	rect = wintypes.RECT()
 	user32.GetClientRect(hwnd, ctypes.byref(rect))
-	pt = wintypes.POINT(int(float(p['x']) * rect.right), int(float(p['y']) * rect.bottom))
+	px, py = _client_pixel(p['x'], p['y'], rect.right - rect.left, rect.bottom - rect.top)
+	pt = wintypes.POINT(px, py)
 	user32.ClientToScreen(hwnd, ctypes.byref(pt))
 	old = wintypes.POINT()
 	user32.GetCursorPos(ctypes.byref(old))
 
-	root = user32.GetAncestor(hwnd, 2)
-	user32.SetForegroundWindow(root)
-	yield from _wait_frames(2)
 	under = user32.WindowFromPoint(pt)
 	if not under or user32.GetAncestor(under, 2) != root:
-		raise RuntimeError('another window covers the Vizard window at that point; not clicking')
+		raise RuntimeError('another window covers the Vizard window at that point; not clicking'
+		                   ' (foreground before the click: %s)' % was_foreground)
 	user32.SetCursorPos(pt.x, pt.y)
 	yield from _wait_frames(2)
 	try:
@@ -912,7 +947,8 @@ def cmd_click(p):
 	finally:
 		if p.get('restore_cursor', True):
 			user32.SetCursorPos(old.x, old.y)
-	return {'clicked': [pt.x, pt.y], 'button': button}
+	return {'clicked': [pt.x, pt.y], 'client_pixel': [px, py], 'client_size': [rect.right - rect.left, rect.bottom - rect.top],
+	        'button': button, 'was_foreground': was_foreground}
 
 
 # ---------------------------------------------------------------------------
@@ -1068,6 +1104,48 @@ def cmd_watch_read(p):
 	return res
 
 
+def _write_rows(path, fmt, columns, rows, meta):
+	"""Write rows (lists matching columns) as CSV, or JSON {meta..., columns, rows}."""
+	path = os.path.abspath(path)
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	if fmt == 'csv':
+		with open(path, 'w', newline='') as f:
+			wr = csv.writer(f)
+			wr.writerow(columns)
+			wr.writerows(rows)
+	else:
+		doc = dict(meta, columns=columns, rows=rows)
+		with open(path, 'w') as f:
+			json.dump(doc, f, indent=1)
+	return path
+
+
+def cmd_watch_export(p):
+	"""Write a watch's full data to a CSV or JSON file, optionally only some columns."""
+	name = p.get('name')
+	if name not in _State.watches:
+		raise ValueError('no watch named %r (have: %s)' % (name, ', '.join(_State.watches) or 'none'))
+	w = _State.watches[name]
+	if not w.rows:
+		raise ValueError('watch %r has no samples yet' % name)
+	path = p.get('path')
+	if not path:
+		raise ValueError('path is required')
+	fmt = (p.get('format') or os.path.splitext(path)[1].lstrip('.') or 'csv').lower()
+	if fmt not in ('csv', 'json'):
+		raise ValueError('format must be csv or json (from the extension or the format argument), got %r' % fmt)
+	all_cols = ['t', 'frame'] + list(w.columns)
+	cols = list(p.get('columns') or all_cols)
+	missing = [c for c in cols if c not in all_cols]
+	if missing:
+		raise ValueError('unknown columns %s; have %s' % (missing, all_cols))
+	idx = [all_cols.index(c) for c in cols]
+	rows = [[r[i] for i in idx] for r in w.rows]
+	meta = {'watch': name, 'expressions': w.sources, 'stop_reason': w.stop_reason, 'samples': len(rows)}
+	path = _write_rows(path, fmt, cols, rows, meta)
+	return {'path': path, 'format': fmt, 'columns': cols, 'rows': len(rows), 'bytes': os.path.getsize(path)}
+
+
 def cmd_watch_list(p):
 	return {n: dict(w.status(), expressions=w.sources) for n, w in _State.watches.items()}
 
@@ -1161,6 +1239,113 @@ def cmd_vizconnect_info(p):
 
 
 # ---------------------------------------------------------------------------
+# Scene statistics
+# ---------------------------------------------------------------------------
+
+# Accessors tried in order; the first one that works on a node is used. Which of these
+# a given Vizard version provides is checked with the vizard_api tool, and the ones that
+# do not exist are reported as unavailable instead of being guessed at.
+_TRIANGLE_ACCESSORS = ('getTriangleCount', 'getPolyCount')
+_TEXTURE_ACCESSORS = ('getTexture',)
+_TEXTURE_LIST = 'getTextureList'
+_LIGHT_LIST = 'getLightList'
+
+
+def _try_accessors(obj, names):
+	"""(value, accessor name) of the first accessor in names that exists and works."""
+	for name in names:
+		fn = getattr(obj, name, None)
+		if fn is None:
+			continue
+		try:
+			return fn(), name
+		except Exception:
+			continue
+	return None, None
+
+
+def _node_cost(node):
+	"""Per-node numbers for scene_stats: dict(triangles, subnodes, texture) with None where unknown."""
+	tris, tri_src = _try_accessors(node, _TRIANGLE_ACCESSORS)
+	try:
+		subnodes = int(node.getNodeCount())
+	except Exception:
+		subnodes = None
+	tex, tex_src = _try_accessors(node, _TEXTURE_ACCESSORS)
+	return {'triangles': int(tris) if isinstance(tris, (int, float)) else None, 'subnodes': subnodes,
+	        'texture': None if tex is None else getattr(tex, 'id', id(tex)),
+	        'sources': {'triangles': tri_src, 'texture': tex_src}}
+
+
+def _count_list(fn_name):
+	fn = getattr(viz, fn_name, None)
+	if fn is None:
+		return None
+	try:
+		return len(fn())
+	except Exception:
+		return None
+
+
+def cmd_scene_stats(p):
+	"""Counts that explain a slow scene: nodes, visible nodes, textures, triangles, lights, heavy nodes."""
+	top = max(0, int(p.get('top', 10)))
+	nodes = [n for n in viz.getNodeList() if n.valid()]
+	by_type = collections.Counter(type(n).__name__ for n in nodes)
+	visible = 0
+	costs = []
+	textures = set()
+	tri_sources = set()
+	for n in nodes:
+		vis = bool(n.getVisible())
+		visible += vis
+		c = _node_cost(n)
+		c['node'], c['visible'] = n, vis
+		costs.append(c)
+		if c['texture'] is not None:
+			textures.add(c['texture'])
+		if c['sources']['triangles']:
+			tri_sources.add(c['sources']['triangles'])
+
+	have_tris = any(c['triangles'] is not None for c in costs)
+	tri_all = sum(c['triangles'] or 0 for c in costs) if have_tris else None
+	tri_visible = sum(c['triangles'] or 0 for c in costs if c['visible']) if have_tris else None
+	# A node's triangles may already include its children's; the totals then double count.
+	notes = []
+	if not have_tris:
+		notes.append('no triangle accessor worked on this Vizard (tried %s); heavy nodes are ranked by '
+		             'sub-node count' % ', '.join(_TRIANGLE_ACCESSORS))
+	else:
+		notes.append('triangles are approximate: group nodes may already include their children')
+	tex_total = _count_list(_TEXTURE_LIST)
+	lights = _count_list(_LIGHT_LIST)
+	lights_by_type = sum(v for k, v in by_type.items() if 'light' in k.lower())
+	if lights is None:
+		lights = lights_by_type if lights_by_type else None
+		if lights is None:
+			notes.append('light count unavailable (no %s and no light nodes in the node list)' % _LIGHT_LIST)
+
+	key = (lambda c: c['triangles'] or 0) if have_tris else (lambda c: c['subnodes'] or 0)
+	heavy = sorted(costs, key=key, reverse=True)[:top]
+	labels = _labels() if heavy else {}
+	return {
+		'nodes': len(nodes),
+		'visible_nodes': visible,
+		'by_type': dict(by_type.most_common()),
+		'textures': tex_total if tex_total is not None else (len(textures) if textures else None),
+		'textures_source': _TEXTURE_LIST if tex_total is not None else ('node textures' if textures else None),
+		'triangles': tri_all,
+		'triangles_visible': tri_visible,
+		'lights': lights,
+		'ranked_by': 'triangles' if have_tris else 'subnodes',
+		'top_nodes': [{'id': c['node'].id, 'type': type(c['node']).__name__,
+		               'names': labels.get(c['node'].id, []), 'visible': c['visible'],
+		               'triangles': c['triangles'], 'subnodes': c['subnodes']} for c in heavy],
+		'notes': notes,
+	}
+
+
+# ---------------------------------------------------------------------------
 # Command table
 # ---------------------------------------------------------------------------
 
@@ -1191,6 +1376,8 @@ COMMANDS = {
 	'watch_start': cmd_watch_start,
 	'watch_read': cmd_watch_read,
 	'watch_list': cmd_watch_list,
+	'watch_export': cmd_watch_export,
+	'scene_stats': cmd_scene_stats,
 	'profile': cmd_profile,
 	'vizconnect_info': cmd_vizconnect_info,
 	'quit': cmd_quit,
