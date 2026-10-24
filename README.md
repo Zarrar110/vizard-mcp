@@ -132,7 +132,7 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `multi_view` | Orbit a node (or point) from N angles, or a list of views, in one grid image; the user's view is restored exactly |
 | `filmstrip` | N frames over time in one grid, to see motion |
 | `record_video` | Record the window for people to watch. Default `format="mp4"`: Vizard's recorder writes an uncompressed AVI (about 25 MB per second at 800x600), which the server then converts to H.264 MP4 (yuv420p, even dimensions, fast-start) and deletes. `crf` (quality, default 23), `fps` and `max_size` tune the output. If no ffmpeg is found or the conversion fails, the AVI is kept and the result says why. `format="avi"` keeps the raw AVI |
-| `record_tour` | Record a video while the camera moves along a path, then give the user's camera back. Either `keyframes` (`[{position, euler or look_at, t}]`, positions on a Catmull-Rom spline or eased/linear via `interp`, angles turning the short way round) or an `orbit` around a node / `target` point (`radius`, `elevation_deg`, `degrees`, `duration`). Output as `record_video`. `dry_run=true` records nothing and returns a grid of `count` frames along the path to judge it first |
+| `record_tour` | Record a video while the camera moves along a path, then give the user's camera back. Either `keyframes` (`[{position, euler or look_at, t}]`, positions on a Catmull-Rom spline or eased/linear via `interp`, angles turning the short way round) or an `orbit` around a node / `target` point (`radius`, `elevation_deg`, `degrees`, `duration`). Output as `record_video`. `dry_run=true` records nothing and returns a grid of `count` frames along the path to judge it first. `mode="steps"` renders the tour frame by frame for a smooth video even when the scene draws slowly (see below) |
 | `pick` | What is at a screen point: node, script name or nearest named ancestor, world point, normal, distance; ignores the user's own avatar head |
 | `project` | Where world points or node centers appear on screen |
 | `camera` | Get/set `viz.MainView`; `hold` keeps the view even when vizconnect drives it |
@@ -148,6 +148,15 @@ Screen coordinates are 0..1 from the top-left corner of a screenshot. Nodes are 
 | `vr_simulate` | Drive vizconnect without a headset: hold head and left/right hand tracker poses (`position`, `euler`) and press, release or hold named input buttons for N frames, to test wrist-tablet menus, laser pointers and grabs on a desktop. Undone by `reset`, on `quit_app` and when the app exits. Errors clearly if the app does not use vizconnect |
 | `wait` | Let N frames and/or seconds pass |
 | `wait_until` | Run until a Python condition is true in the app (`"truck.x > 30"`) |
+
+**Undo and report**
+
+| Tool | What it does |
+|---|---|
+| `snapshot_save` | Remember the local position, orientation (quaternion), scale and visibility of chosen nodes under a name, to put back later: `nodes` (ids or expressions), `named` (every named node, optionally filtered by `pattern`) and/or `root` (a node and everything under it). Optionally also app state: `state` is an expression whose value is copied, `restore_code` a statement that puts it back with the copy as `_state`. `path` also writes a JSON file |
+| `snapshot_restore` | Put a snapshot back (state first, then nodes), from the app's memory by `name` or from a JSON `path`. Reports the nodes that were `missing` (deleted, or no longer found by name) and any value a node refused; the rest are still restored |
+| `snapshot_list` | The snapshots kept in the app; with `path`, describes a snapshot file without needing the app |
+| `make_report` | One self-contained HTML report (images inlined as base64, print-friendly CSS, nothing else to carry around; print it to PDF from a browser) from `sections`: `heading`, `text` (paragraphs, lists, bold/italic/code/links), `watch` (summary table + chart), `validate` (PASS/FAIL badge, error statistics, measured-vs-theory chart), `screenshot` (taken now), `image` (an existing file) and `keyvalue`. The header has the title, author (default Zarrar Abbas), date and what is known of the app and Vizard |
 
 **Measure**
 
@@ -218,6 +227,45 @@ record_tour(orbit="ball", dry_run=True, count=6)          # preview only, nothin
 
 The camera pose is a function of the time since the recording started, applied every frame after the app and vizconnect have moved the view (the same hold `camera(hold=true)` uses), so the video follows real time whatever the frame rate. Keyframes use `euler` in all of them or `look_at` in all of them. Without `t` they are spread evenly over `duration`; `duration` longer than the last `t` holds the final pose. When the tour ends, or fails, the hold is released and the user's position and euler (and any hold they had) are put back. For an orbit, `radius` is the camera distance from the centre; for a node it defaults to 2.8 times half its largest bounding-box side, for a point to 5. The conversion to MP4 happens in the server, so no extra software is needed inside Vizard.
 
+#### `mode="steps"`: a smooth tour of a slow scene
+
+```text
+record_tour(orbit="LAB.site.crane", duration=10, mode="steps", fps=30)
+record_tour(keyframes=[...], mode="steps", fps=24, settle_frames=3, max_size=1280, path="C:/out/flythrough.mp4")
+```
+
+The default `mode="realtime"` records what Vizard renders, so a lab that draws about 10 fps on an integrated GPU gives a 10 fps tour. In `steps` mode the tour is rendered one output frame at a time instead. For each of `fps x duration` frames the view is held at the pose for `t = k / fps`, `settle_frames` rendered frames (default 2) are waited so the scene catches up with the camera, and the window is captured to a numbered PNG in a temporary folder. The server then encodes the sequence with ffmpeg to H.264 MP4 at `fps` (default 30; yuv420p, even dimensions, fast-start, `crf` and `max_size` as in `record_video`) and deletes the PNGs; if encoding fails or there is no ffmpeg, the PNGs are kept and the result gives their folder. The result reports `frames` captured and `wall_s`, the time it took. The camera and any earlier hold are put back exactly as in realtime mode.
+
+It takes as long as the app needs to render and capture each frame, so a 10-second 30 fps tour is 300 captures. Only the camera path is stepped: **the simulation keeps running in wall time**, so physics, animation and anything else the app does advances by about `wall_s` seconds while the video covers `duration` seconds of camera. Motion in the scene is therefore not frame-exact in steps mode; pause or script the app yourself if that matters. Steps mode writes MP4 only.
+
+### `snapshot_*` in detail
+
+```text
+snapshot_save("before", nodes=["ball", "LAB.site.crane.hook"], root="LAB.site.tower",
+              state="LAB.sim.state()", restore_code="LAB.sim.set_state(_state)")
+snapshot_save("everything", named=True, path="C:/out/everything.json")
+... try something with set_node / run_code ...
+snapshot_restore("before")
+snapshot_restore(path="C:/out/everything.json")        # another session of the same script
+```
+
+Each node's **local** position, orientation (as a quaternion, so there is no euler wrap-around), scale and visibility are recorded; the camera and colours are not. Nodes are found again by the expression they were given by, or by their first script name when chosen with `named` or `root`; in the app that saved the snapshot a node whose name no longer works is looked up by id. A snapshot file read in another session only trusts names, since ids change between runs: nodes it can only identify by id come back as `missing`. `state` is deep-copied when saved, and passed to `restore_code` as `_state`, which runs in the app's `__main__` before the nodes are restored; if it fails the error is reported and the nodes are still restored. A file keeps `state` only when it is plain JSON data (numbers, strings, lists, dicts); anything else is kept in the app's memory only, and the save says so. If the app writes a node's transform every frame it will overwrite a restored one, as with `set_node`.
+
+### `make_report` in detail
+
+```text
+make_report(title="Drop test", path="C:/out/drop_test.html", sections=[
+  {"type": "heading", "text": "Results"},
+  {"type": "text", "text": "Dropped from **2 m**, e = 0.8.\n\n- bounce 1 peaked at 1.28 m"},
+  {"type": "watch", "name": "bounce", "columns": ["h"]},
+  {"type": "validate", "watch": "bounce", "measured": "h", "theory": "h0 - v**2/(2*g)",
+   "constants": {"h0": 2.0, "g": 9.81}, "abs_tol": 0.02, "t_max": 0.5},
+  {"type": "screenshot", "caption": "End state"},
+  {"type": "keyvalue", "items": {"Restitution": 0.8}}])
+```
+
+Every section is checked before the app is asked for anything, and a section that fails (an unknown watch, say) stops the report with its number and writes nothing. The page uses no external fonts, scripts or images, so it can be moved or e-mailed as one file; `@media print` rules keep figures and tables from splitting across pages, so the browser's Print > Save as PDF gives the PDF. Without a running app the static sections still work and the header says the app was not connected.
+
 ### `vr_simulate` in detail
 
 ```text
@@ -253,6 +301,7 @@ The offline tests use stand-ins that follow the calls the code makes. What has a
   - A vizconnect bridge lab: a 90° orbit was recorded over vizconnect, from an 85 MB AVI to an 848 KB MP4, and `viz.MainView` was restored exactly.
   - A video moves only as smoothly as the app renders. Vizard's recorder captures real frames, so a lab drawing 10 fps on an integrated GPU gives a 10 fps tour inside a 30 fps file.
   - Record after the app has finished loading. A tour started while a heavy scene still builds its terrain and shaders caught a single frame.
+- **`record_tour` mode `steps`, `snapshot_*` and `make_report`**: written against the stand-in `viz` module and a fake ffmpeg (and a real ffmpeg encoding a PNG sequence where one is installed), and not yet run in a real Vizard. `tests/live_test.py` now checks them on the demo scene: a 2 s steps tour whose MP4 has `fps x 2` frames (counted by ffmpeg) with the camera restored and the PNGs deleted; a snapshot of a label, a beam, a temporary node and a state value that is moved and put back, from memory and from the JSON file, with the deleted node reported as missing; and a report with a watch, a validate and a screenshot. Things only a real Vizard can answer: that `getQuat` / `setQuat` / `getScale` with `viz.ABS_PARENT` behave on every node type (a node that cannot give a value records `null` and is skipped on restore), how many frames each `window.screenCapture` really costs on a heavy lab, and that the window keeps one size throughout a steps tour.
 - **`vizard-mcp install` / `doctor`**: run on Windows with Claude Code. `doctor` reported Python, mcp, Pillow, Vizard 8, the port, ffmpeg and the Claude Code entry as PASS, and the missing Claude Desktop config as WARN. `install --dry-run` found the existing entry and changed nothing. A path written with `/` and one written with `\` count as the same program. Claude Desktop itself has not been tried. The Vizard version is only what the install folder name says: `Vizard8` gives `8`.
 
 ## Running the tests
@@ -264,7 +313,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 37 tools, error handling, stdio handshake), plus vizmcp's newer commands (GUI listing and clicking, `vr_simulate`, `validate`, `watch_export`, `scene_stats`, the camera-tour maths and `record_tour`) run against stand-ins for Vizard's `viz` and `vizconnect` modules. MP4 conversion is tested with a tiny fake `ffmpeg` script (and a real one when installed), and `doctor` / `install` with temporary `HOME` and `APPDATA` folders.
+It covers the socket client (against a fake vizmcp server), the image helpers, the API index (built from a small fake Vizard tree) and the MCP server (all 41 tools, error handling, stdio handshake), plus vizmcp's newer commands (GUI listing and clicking, `vr_simulate`, `validate`, `watch_export`, `scene_stats`, the camera-tour maths, `record_tour` in both modes, snapshots and report building) run against stand-ins for Vizard's `viz` and `vizconnect` modules. MP4 conversion is tested with a tiny fake `ffmpeg` script (and a real one when installed), and `doctor` / `install` with temporary `HOME` and `APPDATA` folders.
 
 CI also builds the sdist and wheel, runs `twine check`, and installs the wheel in a clean environment (nothing is published).
 

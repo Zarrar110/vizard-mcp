@@ -15,7 +15,7 @@ from typing import Any
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import api_index, doctor as doctor_mod, imaging, video, winviz
+from . import api_index, doctor as doctor_mod, imaging, report, video, winviz
 from .client import NotConnected, VizardClient, VizardError
 
 VIZARD_SIDE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vizard_side')
@@ -35,8 +35,13 @@ Before writing Vizard code, check exact names and signatures with vizard_api.
 Seeing: screenshot (annotate=true labels named nodes), multi_view (orbit a node from
 several angles without disturbing the user's view), filmstrip (frames over time), pick
 (what is at a point of a screenshot). For people to watch: record_video (MP4) and record_tour
-(MP4 while the camera flies along keyframes or orbits a node; dry_run previews the path).
+(MP4 while the camera flies along keyframes or orbits a node; dry_run previews the path;
+mode="steps" renders it frame by frame for a smooth video even when the scene draws slowly).
 doctor checks the installation.
+Undo: snapshot_save records the transforms and visibility of chosen nodes (and optional app state)
+under a name, snapshot_restore puts them back (reporting nodes that are gone), snapshot_list shows them.
+Reports: make_report writes a self-contained HTML report (print it to PDF) from headings, text,
+watches, validate results, screenshots, images and key-value tables.
 Measuring: watch_start / watch_read / watch_plot record any expressions every frame
 (e.g. a deflection or a velocity) so results can be checked against theory, and
 watch_export writes them to CSV or JSON for reports;
@@ -321,15 +326,8 @@ def vizard_api(query: str = '', name: str | None = None, limit: int = 30) -> str
 # Seeing
 # ---------------------------------------------------------------------------
 
-@mcp.tool(structured_output=False)
-def screenshot(max_size: int = 1024, annotate: bool = False, label_limit: int = 25,
-               save_to: str | None = None) -> list[Any]:
-	"""Capture the Vizard window as it is rendered now and return the image.
-
-	annotate: draw a tag on each named node that is on screen (its script name at its
-	          bounding-box center), to connect what you see with the code.
-	max_size: longest side of the returned image in pixels (0 = full size).
-	save_to: optional .png path to also keep the full-size capture."""
+def _take_screenshot(save_to=None, annotate=False, label_limit=25):
+	"""Capture the window now; returns (full-size PIL image, description)."""
 	res = _call('screenshot', wait_s=30, path=os.path.abspath(save_to) if save_to else None)
 	im = imaging.load(res['path'])
 	text = 'frame %s, window %s, saved at %s' % (res.get('frame'), res.get('window_size'), res['path'])
@@ -339,6 +337,19 @@ def screenshot(max_size: int = 1024, annotate: bool = False, label_limit: int = 
 		text += '\nlabelled %d of %d named nodes on screen' % (len(labels['items']), labels['total_on_screen'])
 		if labels.get('skipped'):
 			text += '; not labelled: %s' % ', '.join('%d %s' % (n, why) for why, n in labels['skipped'].items())
+	return im, text
+
+
+@mcp.tool(structured_output=False)
+def screenshot(max_size: int = 1024, annotate: bool = False, label_limit: int = 25,
+               save_to: str | None = None) -> list[Any]:
+	"""Capture the Vizard window as it is rendered now and return the image.
+
+	annotate: draw a tag on each named node that is on screen (its script name at its
+	          bounding-box center), to connect what you see with the code.
+	max_size: longest side of the returned image in pixels (0 = full size).
+	save_to: optional .png path to also keep the full-size capture."""
+	im, text = _take_screenshot(save_to, annotate, label_limit)
 	return [_jpeg(imaging.fit(im, max_size)), text]
 
 
@@ -498,13 +509,53 @@ def record_video(seconds: float = 5.0, path: str | None = None, format: str = 'm
 	return _dump(_finish_video(res, format, crf, fps, max_size))
 
 
+STEP_FRAME_LIMIT = 20000
+STEPS_NOTE = ('The simulation kept running in wall time (%.1f s) while the camera was stepped through %.1f s of '
+              'path, so motion in the scene is not frame-exact; only the camera path is.')
+
+
+def _tour_steps(path, crf, fps, max_size, total, settle, **tour):
+	"""record_tour mode "steps": the app captures numbered PNGs, they are encoded to MP4 here."""
+	frames = max(1, round(fps * total))
+	if frames > STEP_FRAME_LIMIT:
+		raise VizardToolError('%d frames (fps x duration) is more than the limit of %d; lower fps or duration.'
+		                      % (frames, STEP_FRAME_LIMIT))
+	res = _call('record_tour', wait_s=frames * 0.3 * (settle + 3) + 120, mode='steps', fps=fps,
+	            settle_frames=settle, **tour)
+	folder, pattern = res['frames_dir'], res['frame_pattern']
+	mp4 = os.path.splitext(os.path.abspath(path))[0] + '.mp4' if path else folder + '.mp4'
+	res['simulation_note'] = STEPS_NOTE % (res['wall_s'], res['duration'])
+	try:
+		out = video.encode_sequence(folder, pattern, mp4, res['fps'], crf=crf, max_size=max_size)
+	except video.VideoError as e:
+		return dict(res, format='png', mp4_converted=False,
+		            mp4_error='%s\nThe %d PNG frames were kept in %s' % (e, res['frames'], folder))
+	left = 0
+	for k in range(res['frames']):
+		try:
+			os.remove(os.path.join(folder, pattern % k))
+		except OSError:
+			left += 1
+	try:
+		os.rmdir(folder)
+	except OSError:
+		pass
+	res.pop('frames_dir'), res.pop('frame_pattern')
+	res.update(path=out['path'], bytes=out['bytes'], format='mp4', mp4_converted=True, ffmpeg=out['ffmpeg'],
+	           ffmpeg_source=out['ffmpeg_source'], frames_deleted=left == 0)
+	if left:
+		res['note'] = 'could not delete %d of the PNG frames in %s' % (left, folder)
+	return res
+
+
 @mcp.tool(structured_output=False)
 def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None = None,
                 target: list[float] | None = None, radius: float | None = None,
                 elevation_deg: float = 25.0, degrees: float = 360.0, start_yaw_deg: float = 45.0,
                 duration: float | None = None, interp: str = 'catmull', path: str | None = None,
                 format: str = 'mp4', crf: int = 23, fps: float | None = None, max_size: int | None = None,
-                dry_run: bool = False, count: int = 6, preview_size: int = 1400) -> Any:
+                dry_run: bool = False, count: int = 6, preview_size: int = 1400,
+                mode: str = 'realtime', settle_frames: int = 2) -> Any:
 	"""Record a video while the camera flies along a path (a fly-through or an orbit). The view
 	is held for the duration and then given back exactly as the user had it. The output is MP4
 	like record_video (see there for format, crf, fps, max_size and ffmpeg).
@@ -522,6 +573,18 @@ def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None
 	interp: "catmull" (smooth through the keyframes), "smoothstep" (eases to a stop at each) or "linear".
 	dry_run: record nothing; return a grid image of `count` (2..12) frames along the path
 	         (preview_size = longest side of the grid) so the path can be judged first.
+	mode: "realtime" (default) records with Vizard's recorder while the camera follows the clock,
+	      so the video is as smooth as the app renders (a heavy scene on an integrated GPU may
+	      draw only ~10 fps). "steps" makes a smooth video of any scene: for each of fps x duration
+	      output frames the camera is put at t = k / fps, `settle_frames` rendered frames are
+	      waited, and the window is captured to a numbered PNG; the PNGs are then encoded here to
+	      H.264 MP4 at `fps` (default 30; yuv420p, even dimensions, fast-start) and deleted (kept if
+	      encoding fails). It takes as long as rendering and capturing each frame, which the result
+	      reports (frames, wall_s). The simulation keeps running in wall time while the camera is
+	      stepped, so only the camera path is frame-exact, not motion in the scene. steps writes
+	      MP4 only; fps is the output rate, max_size and crf work as in record_video.
+	settle_frames: with mode "steps", rendered frames to wait after moving the camera and before
+	      each capture (default 2).
 
 	Vizard is Y-up, left-handed; euler is [yaw, pitch, roll] in degrees."""
 	_check_video_options(format, crf, fps, max_size)
@@ -531,6 +594,13 @@ def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None
 		raise VizardToolError('interp must be "catmull", "smoothstep" or "linear".')
 	if duration is not None and duration <= 0:
 		raise VizardToolError('duration must be more than 0.')
+	if mode not in ('realtime', 'steps'):
+		raise VizardToolError('mode must be "realtime" or "steps".')
+	if mode == 'steps' and not dry_run:
+		if format != 'mp4':
+			raise VizardToolError('mode "steps" writes MP4 only; leave format as "mp4".')
+		if not 0 <= settle_frames <= 60:
+			raise VizardToolError('settle_frames must be 0..60.')
 	if dry_run:
 		n = max(2, min(12, count))
 		res = _call('record_tour', wait_s=30 + 8 * n, keyframes=keyframes, orbit=orbit, target=target,
@@ -544,9 +614,13 @@ def record_tour(keyframes: list[dict[str, Any]] | None = None, orbit: str | None
 		                                           s['view'].get('look_at') or s['view'].get('euler'))
 		                   for c, s in zip(captions, shots))
 		return [_jpeg(imaging.grid(images, captions, preview_size)), text]
-	avi, _ = _video_paths(path, format)
 	last_t = max([float(k['t']) for k in keyframes or [] if isinstance(k, dict) and k.get('t') is not None] or [0])
 	total = duration or last_t or 8.0
+	if mode == 'steps':
+		return _dump(_tour_steps(path, crf, fps or 30.0, max_size, total, settle_frames, keyframes=keyframes,
+		                         orbit=orbit, target=target, radius=radius, elevation_deg=elevation_deg,
+		                         degrees=degrees, start_yaw_deg=start_yaw_deg, duration=duration, interp=interp))
+	avi, _ = _video_paths(path, format)
 	res = _call('record_tour', wait_s=total + 120, keyframes=keyframes, orbit=orbit, target=target,
 	            radius=radius, elevation_deg=elevation_deg, degrees=degrees, start_yaw_deg=start_yaw_deg,
 	            duration=duration, interp=interp, out_path=avi)
@@ -706,11 +780,8 @@ def watch_read(name: str, max_points: int = 100, stop: bool = False, delete: boo
 	                   csv_path=os.path.abspath(csv_path) if csv_path else None))
 
 
-@mcp.tool(structured_output=False)
-def watch_plot(name: str, columns: list[str] | None = None, title: str | None = None) -> list[Any]:
-	"""Plot a watch's columns against app time as a line chart image (max marked).
-	columns: which ones (default all). Columns with very different scales are clearer
-	in separate plots."""
+def _watch_chart(name, columns=None, title=None):
+	"""(chart image, watch_read result) for a watch's columns against app time."""
 	res = _call('watch_read', name=name, max_points=1500)
 	cols = res['columns']
 	if not res.get('samples'):
@@ -721,7 +792,15 @@ def watch_plot(name: str, columns: list[str] | None = None, title: str | None = 
 		raise VizardToolError('unknown columns %s; have %s' % (missing, cols[2:]))
 	t = [r[0] for r in res['samples']]
 	series = [(c, [r[cols.index(c)] for r in res['samples']]) for c in want]
-	im = imaging.line_chart(title or 'watch "%s"' % name, t, series)
+	return imaging.line_chart(title or 'watch "%s"' % name, t, series), res
+
+
+@mcp.tool(structured_output=False)
+def watch_plot(name: str, columns: list[str] | None = None, title: str | None = None) -> list[Any]:
+	"""Plot a watch's columns against app time as a line chart image (max marked).
+	columns: which ones (default all). Columns with very different scales are clearer
+	in separate plots."""
+	im, res = _watch_chart(name, columns, title)
 	return [_jpeg(im), 'csv: %s; status: %s' % (res.get('csv'), res['status'])]
 
 
@@ -740,6 +819,26 @@ def watch_export(name: str, path: str, format: str | None = None,
 		raise VizardToolError('format must be "csv" or "json".')
 	return _dump(_call('watch_export', name=name, path=os.path.abspath(path),
 	                   format=format.lower() if format else None, columns=columns))
+
+
+def _validate(watch, measured, theory, constants=None, abs_tol=None, pct_tol=None, t_min=None,
+              t_max=None, min_pass_pct=100.0, title=None, csv_path=None):
+	"""Run the app's validate command; returns (measured-vs-theory chart, result without the series)."""
+	if not measured or not theory:
+		raise VizardToolError('measured and theory are required.')
+	for label, v in (('abs_tol', abs_tol), ('pct_tol', pct_tol)):
+		if v is not None and v < 0:
+			raise VizardToolError('%s must be 0 or more.' % label)
+	if not 0 <= min_pass_pct <= 100:
+		raise VizardToolError('min_pass_pct must be 0..100.')
+	res = _call('validate', watch=watch, measured=measured, theory=theory, constants=constants,
+	            abs_tol=abs_tol, pct_tol=pct_tol, t_min=t_min, t_max=t_max, min_pass_pct=min_pass_pct,
+	            csv_path=os.path.abspath(csv_path) if csv_path else None, max_points=1500)
+	series = res.pop('series')
+	t = [r[0] for r in series]
+	im = imaging.line_chart(title or 'watch "%s": %s vs theory' % (watch, measured), t,
+	                        [('measured', [r[1] for r in series]), ('theory', [r[2] for r in series])])
+	return im, res
 
 
 @mcp.tool(structured_output=False)
@@ -763,20 +862,8 @@ def validate(watch: str, measured: str, theory: str, constants: dict[str, float]
 	t_min / t_max: only samples in this window of app time (seconds).
 	min_pass_pct: overall pass needs at least this % of samples within tolerance (default all).
 	csv_path: where to write the per-sample comparison (default: the vizmcp temp folder)."""
-	if not measured or not theory:
-		raise VizardToolError('measured and theory are required.')
-	for label, v in (('abs_tol', abs_tol), ('pct_tol', pct_tol)):
-		if v is not None and v < 0:
-			raise VizardToolError('%s must be 0 or more.' % label)
-	if not 0 <= min_pass_pct <= 100:
-		raise VizardToolError('min_pass_pct must be 0..100.')
-	res = _call('validate', watch=watch, measured=measured, theory=theory, constants=constants,
-	            abs_tol=abs_tol, pct_tol=pct_tol, t_min=t_min, t_max=t_max, min_pass_pct=min_pass_pct,
-	            csv_path=os.path.abspath(csv_path) if csv_path else None, max_points=1500)
-	series = res.pop('series')
-	t = [r[0] for r in series]
-	im = imaging.line_chart(title or 'watch "%s": %s vs theory' % (watch, measured), t,
-	                        [('measured', [r[1] for r in series]), ('theory', [r[2] for r in series])])
+	im, res = _validate(watch, measured, theory, constants, abs_tol, pct_tol, t_min, t_max,
+	                    min_pass_pct, title, csv_path)
 	return [_jpeg(im), _dump(res)]
 
 
@@ -797,6 +884,283 @@ def profile(frames: int = 120, top: int = 25, sort: str = 'self') -> str:
 	Returns frame time (mean, p95, max), FPS, Python milliseconds per frame, and the top
 	functions by self time (sort="self") or including callees (sort="total")."""
 	return _dump(_call('profile', wait_s=frames / 5.0 + 60, frames=frames, top=top, sort=sort))
+
+
+# ---------------------------------------------------------------------------
+# Snapshots
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def snapshot_save(name: str, nodes: list[str] | None = None, named: bool = False, pattern: str = '',
+                  root: str | None = None, max_nodes: int = 2000, state: str | None = None,
+                  restore_code: str | None = None, path: str | None = None) -> str:
+	"""Remember how part of the scene looks now, to put it back later with snapshot_restore (try
+	something, then undo it). Records each node's local position, orientation (quaternion) and scale,
+	and whether it is visible, under `name` in the app (a second save under the same name replaces it).
+	Choose the nodes with any of:
+	nodes: ids or Python expressions, e.g. ["ball", "LAB.site.crane.hook", 123].
+	named: every node the script has a name for (as find_nodes lists them); `pattern` keeps only
+	       names containing that text (case-insensitive).
+	root: this node and everything under it.
+	max_nodes: stop at this many nodes (the result says if it was cut off).
+	state: optionally also keep app state: a Python expression whose value is copied, e.g.
+	       "LAB.sim.state()". Give restore_code, a statement that puts it back, with the copy
+	       available as `_state`, e.g. "LAB.sim.set_state(_state)".
+	path: also write the snapshot to this JSON file (snapshot_restore can read it in a later session
+	      of the same script). Nodes given by name are found again by name; nodes given by id or
+	      without a name only in the app that saved them. State is written only if it is plain
+	      JSON data (numbers, strings, lists, dicts).
+	Camera and material colour are not recorded; use camera for the view. Scripts that move a node
+	every frame will overwrite a restored transform."""
+	if not name.strip():
+		raise VizardToolError('name is required.')
+	if not (nodes or named or root is not None or state):
+		raise VizardToolError('Give nodes, named, root or state: nothing to record.')
+	if restore_code and not state:
+		raise VizardToolError('restore_code needs state (an expression that returns the value to keep).')
+	if max_nodes < 1:
+		raise VizardToolError('max_nodes must be at least 1.')
+	return _dump(_call('snapshot_save', name=name, nodes=nodes or None, named=named or None,
+	                   pattern=pattern or None, root=root, max_nodes=max_nodes, state=state,
+	                   restore_code=restore_code, path=os.path.abspath(path) if path else None))
+
+
+@mcp.tool()
+def snapshot_restore(name: str | None = None, path: str | None = None,
+                     restore_code: str | None = None) -> str:
+	"""Put a snapshot back: first the app state (if the snapshot has some), then every recorded
+	node's position, orientation, scale and visibility. A node that no longer exists, or cannot
+	be found again, is listed under `missing` with the reason; the rest are still restored.
+	`failed` lists values a node refused. The snapshot stays and can be restored again.
+
+	name: a snapshot saved with snapshot_save (see snapshot_list).
+	path: a snapshot JSON file to read instead (it is also kept in the app under its name, or
+	      under `name` if you give one).
+	restore_code: use this statement instead of the one saved with the state; the saved copy of
+	      the state is available as `_state`."""
+	if not name and not path:
+		raise VizardToolError('Give name, or path of a snapshot file.')
+	return _dump(_call('snapshot_restore', name=name, path=os.path.abspath(path) if path else None,
+	                   restore_code=restore_code))
+
+
+@mcp.tool()
+def snapshot_list(path: str | None = None) -> str:
+	"""List the snapshots kept in the app: name, when it was taken, how many nodes, whether it has
+	app state and restore code, and its file if it has one. With `path`, describe a snapshot JSON
+	file instead (read here, the app is not needed)."""
+	if path:
+		path = os.path.abspath(path)
+		try:
+			with open(path, 'r', encoding='utf-8') as f:
+				doc = json.load(f)
+		except (OSError, ValueError) as e:
+			raise VizardToolError('Cannot read the snapshot file %s: %s' % (path, e))
+		if not isinstance(doc, dict) or doc.get('format') != 'vizmcp-snapshot':
+			raise VizardToolError('%s is not a vizmcp snapshot file.' % path)
+		st = doc.get('state') or {}
+		return _dump({'file': path, 'name': doc.get('name'), 'created': doc.get('created'),
+		              'version': doc.get('version'), 'script': doc.get('script'),
+		              'nodes': len(doc.get('nodes') or []), 'truncated': doc.get('truncated'),
+		              'state_expression': st.get('expression'), 'restore_code': bool(st.get('restore_code')),
+		              'state_in_file': bool(st.get('value_exact'))})
+	return _dump(_call('snapshot_list'))
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+_REPORT_KEYS = {
+	'heading': ({'text'}, {'level'}),
+	'text': ({'text'}, set()),
+	'watch': ({'name'}, {'columns', 'title', 'caption'}),
+	'validate': ({'watch', 'measured', 'theory'}, {'constants', 'abs_tol', 'pct_tol', 't_min', 't_max',
+	                                              'min_pass_pct', 'title', 'caption'}),
+	'screenshot': (set(), {'annotate', 'label_limit', 'caption'}),
+	'image': ({'path'}, {'caption'}),
+	'keyvalue': ({'items'}, {'caption'}),
+}
+_REPORT_ALIASES = {'table': 'keyvalue', 'kv': 'keyvalue', 'paragraph': 'text', 'markdown': 'text'}
+
+
+def _check_report_sections(sections):
+	"""Validate every section before the app is touched; returns them with canonical types."""
+	if not sections:
+		raise VizardToolError('sections is empty: give at least one section.')
+	out = []
+	for i, sec in enumerate(sections, 1):
+		where = 'section %d' % i
+		if not isinstance(sec, dict) or not isinstance(sec.get('type'), str):
+			raise VizardToolError('%s must be an object with a "type" (%s).' % (where, ', '.join(_REPORT_KEYS)))
+		kind = _REPORT_ALIASES.get(sec['type'], sec['type'])
+		if kind not in _REPORT_KEYS:
+			raise VizardToolError('%s: unknown type %r; use one of %s.' % (where, sec['type'], ', '.join(_REPORT_KEYS)))
+		need, may = _REPORT_KEYS[kind]
+		given = set(sec) - {'type'}
+		missing = [k for k in sorted(need) if sec.get(k) in (None, '')]
+		if missing:
+			raise VizardToolError('%s (%s) needs %s.' % (where, kind, ', '.join(missing)))
+		extra = sorted(given - need - may)
+		if extra:
+			raise VizardToolError('%s (%s): unknown %s; it takes %s.' % (
+				where, kind, ', '.join(extra), ', '.join(sorted(need | may)) or 'nothing else'))
+		if kind == 'image' and not os.path.isfile(sec['path']):
+			raise VizardToolError('%s (image): no such file: %s' % (where, sec['path']))
+		if kind == 'keyvalue':
+			items = sec['items']
+			if not (isinstance(items, dict) or (isinstance(items, list) and all(
+					isinstance(x, (list, tuple)) and len(x) == 2 for x in items))):
+				raise VizardToolError('%s (keyvalue): items must be an object or a list of [key, value] pairs.' % where)
+		out.append(dict(sec, type=kind))
+	return out
+
+
+def _report_info():
+	"""Header lines about the app and Vizard, or a note that no app answered."""
+	try:
+		info = _call('info')
+	except VizardToolError:
+		return [('Vizard app', 'not connected when the report was made')]
+	fps = info.get('fps')
+	rows = [('Vizard', info.get('vizard_version')), ('Script', info.get('script')),
+	        ('Window', 'x'.join(str(v) for v in info.get('window_size') or [])),
+	        ('Frame rate', '%.1f fps' % fps if fps else None), ('Scene nodes', info.get('node_count')),
+	        ('vizmcp', info.get('vizmcp_version')), ('Python (in Vizard)', info.get('python'))]
+	return [(k, v) for k, v in rows if v not in (None, '')]
+
+
+def _report_watch(sec, max_size):
+	im, res = _watch_chart(sec['name'], sec.get('columns'), sec.get('title'))
+	f = report.fmt
+	cols = sec.get('columns') or res['columns'][2:]
+	rows = []
+	for c in cols:
+		st = res['stats'].get(c)
+		if st is None:          # t and frame have no statistics
+			continue
+		rows.append([c, st['n'], f(st['first']), f(st['last']), '%s (t=%s)' % (f(st['min']), f(st['t_min'])),
+		             '%s (t=%s)' % (f(st['max']), f(st['t_max'])), f(st['mean'])])
+	status = res['status']
+	cap = sec.get('caption') or 'Watch "%s": %d samples, %s.' % (
+		sec['name'], status['samples'], 'still recording' if status['active'] else 'stopped (%s)' % status['stop_reason'])
+	return [report.table(['Column', 'n', 'first', 'last', 'min', 'max', 'mean'], rows, cap),
+	        report.figure(imaging.to_png(im), 'image/png', alt='Chart of watch %s' % sec['name'])], None
+
+
+def _report_validate(sec, max_size):
+	im, res = _validate(sec['watch'], sec['measured'], sec['theory'], sec.get('constants'), sec.get('abs_tol'),
+	                    sec.get('pct_tol'), sec.get('t_min'), sec.get('t_max'), sec.get('min_pass_pct', 100.0),
+	                    sec.get('title'), None)
+	passed = res.get('passed')
+	if passed is None:
+		line = 'No tolerance was given, so there is no pass/fail verdict.'
+	else:
+		line = '%d of %d samples within tolerance (%.1f %%, %.1f %% required).' % (
+			res['passing_samples'], res['samples'], res['pass_pct'], res['min_pass_pct'])
+	f = report.fmt
+	rows = [('Measured column', '%s of watch "%s"' % (res['measured'], res['watch'])), ('Theory', res['theory'])]
+	if res.get('constants'):
+		rows.append(('Constants', ', '.join('%s = %s' % (k, f(v)) for k, v in res['constants'].items())))
+	if res.get('abs_tol') is not None or res.get('pct_tol') is not None:
+		rows.append(('Tolerance', ' and '.join(x for x in (
+			'%s absolute' % f(res['abs_tol']) if res.get('abs_tol') is not None else '',
+			'%s %% of theory' % f(res['pct_tol']) if res.get('pct_tol') is not None else '') if x)))
+	rows += [('Samples compared', '%d (%d skipped)' % (res['samples'], res['skipped'])),
+	         ('Max absolute error', '%s at t = %s s' % (f(res['max_abs_error']), f(res['t_of_max_error']))),
+	         ('Mean absolute error', f(res['mean_abs_error'])), ('RMS error', f(res['rms_error'])), ('Bias', f(res['bias'])),
+	         ('Max error, % of theory', f(res['max_pct_error'])), ('Mean error, % of theory', f(res['mean_pct_error']))]
+	if res.get('first_failure'):
+		ff = res['first_failure']
+		rows.append(('First failure', 't = %s s: measured %s, theory %s' % (f(ff['t']), f(ff['measured']), f(ff['theory']))))
+	html = ['<p class="verdict">%s &nbsp; %s</p>' % (report.badge(passed), report.esc(line)),
+	        report.keyvalue(rows, sec.get('caption')),
+	        report.figure(imaging.to_png(im), 'image/png', alt='Measured against theory')]
+	return html, {'watch': res['watch'], 'measured': res['measured'], 'passed': passed,
+	              'samples': res['samples'], 'max_abs_error': res['max_abs_error']}
+
+
+def _report_screenshot(sec, max_size):
+	im, _ = _take_screenshot(None, bool(sec.get('annotate')), int(sec.get('label_limit', 25)))
+	return [report.figure(imaging.to_jpeg(imaging.fit(im, max_size)), 'image/jpeg',
+	                      sec.get('caption') or 'Screenshot of the Vizard window', 'Screenshot')], None
+
+
+def _report_image(sec, max_size):
+	try:
+		im = imaging.load(sec['path'])
+	except OSError as e:
+		raise VizardToolError('Cannot read the image %s: %s' % (sec['path'], e))
+	im = imaging.fit(im, max_size)
+	if sec['path'].lower().endswith('.png'):
+		data, mime = imaging.to_png(im), 'image/png'
+	else:
+		data, mime = imaging.to_jpeg(im), 'image/jpeg'
+	return [report.figure(data, mime, sec.get('caption') or os.path.basename(sec['path']))], None
+
+
+@mcp.tool()
+def make_report(sections: list[dict[str, Any]], path: str | None = None, title: str = 'Vizard report',
+                author: str = 'Zarrar Abbas', date: str | None = None, max_image_size: int = 1400) -> str:
+	"""Write a self-contained HTML report (images embedded as base64, a print-friendly stylesheet,
+	no other files): open it in a browser, or print it to save a PDF. Returns the file path and a
+	summary. The header has the title, author, date and what is known of the running app and Vizard
+	(version, script, window, frame rate, node count; "not connected" if no app answers).
+
+	sections: a list of objects, each with a "type":
+	  {"type": "heading", "text": "Results", "level": 2}    (level 2..5)
+	  {"type": "text", "text": "..."}   blank-line separated paragraphs, "# " headings, "- " and
+	        "1. " lists, **bold**, *italic*, `code`, [links](https://...). HTML is escaped.
+	  {"type": "watch", "name": "bounce", "columns": ["h"], "title": "...", "caption": "..."}
+	        table of first / last / min / max / mean per column and a line chart of the watch.
+	  {"type": "validate", "watch": "bounce", "measured": "h", "theory": "h0 - v**2/(2*g)",
+	        "constants": {...}, "abs_tol": 0.02, "pct_tol": null, "t_min": null, "t_max": null,
+	        "min_pass_pct": 100}   the validate tool: a PASS / FAIL badge (NO VERDICT without a
+	        tolerance), error statistics and the measured-vs-theory chart.
+	  {"type": "screenshot", "annotate": false, "caption": "..."}   the Vizard window as it is now.
+	  {"type": "image", "path": "C:/out/photo.png", "caption": "..."}   an existing PNG or JPEG.
+	  {"type": "keyvalue", "items": {"Load": "1 kN", "Span": "2 m"}, "caption": "..."}   a two-column
+	        table; items may also be a list of [key, value] pairs. ("table" is accepted too.)
+	The arguments of every section are checked before anything is taken from the app; a section
+	that fails (unknown watch, ...) stops the report with the section number, nothing is written.
+	path: output .html file (default: the vizmcp temp folder). date: default today.
+	max_image_size: longest side of embedded screenshots and images, in pixels."""
+	sections = _check_report_sections(sections)
+	if max_image_size < 16:
+		raise VizardToolError('max_image_size must be at least 16 pixels.')
+	builders = {'watch': _report_watch, 'validate': _report_validate, 'screenshot': _report_screenshot,
+	            'image': _report_image}
+	body, results, images = [], [], 0
+	for i, sec in enumerate(sections, 1):
+		kind = sec['type']
+		if kind == 'heading':
+			body.append(report.heading(sec['text'], sec.get('level', 2)))
+		elif kind == 'text':
+			body.append(report.markdown(sec['text']))
+		elif kind == 'keyvalue':
+			body.append(report.keyvalue(sec['items'], sec.get('caption')))
+		else:
+			try:
+				html, result = builders[kind](sec, max_image_size)
+			except VizardToolError as e:
+				raise VizardToolError('Report not written. Section %d (%s): %s' % (i, kind, e))
+			body.extend(html)
+			images += sum(h.count('<img ') for h in html)
+			if result:
+				results.append(dict(result, section=i))
+	when = date or time.strftime('%Y-%m-%d')
+	doc = report.document(title, author, when, _report_info(), body)
+	out = os.path.abspath(path) if path else os.path.join(tempfile.gettempdir(), 'vizmcp',
+	                                                       'report_%s.html' % time.strftime('%Y%m%d_%H%M%S'))
+	os.makedirs(os.path.dirname(out), exist_ok=True)
+	with open(out, 'w', encoding='utf-8') as f:
+		f.write(doc)
+	summary = {'path': out, 'bytes': os.path.getsize(out), 'sections': len(sections), 'images': images,
+	           'validations': results}
+	if results:
+		summary['all_validations_passed'] = (all(r['passed'] for r in results)
+		                                     if all(r['passed'] is not None for r in results) else None)
+	return _dump(summary)
 
 
 @mcp.tool()

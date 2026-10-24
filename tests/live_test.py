@@ -10,6 +10,7 @@ Needs a real Vizard install. Under pytest it is skipped unless VIZMCP_LIVE=1.
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -67,6 +68,18 @@ def plays_as_h264(path):
 		out = subprocess.run([ffmpeg, '-hide_banner', '-i', path], stdout=subprocess.PIPE,
 		                     stderr=subprocess.STDOUT).stdout.decode()
 	return 'h264' in out, '%d bytes; %s' % (os.path.getsize(path), ' '.join(out.split())[:200])
+
+
+def video_frames(path):
+	"""How many video frames the file has, counted by decoding it with the server's ffmpeg
+	(`ffmpeg -i f -f null -` prints frame=N); None if that cannot be done."""
+	found = video.find_ffmpeg()
+	if found is None or not os.path.isfile(path):
+		return None
+	out = subprocess.run([found[0], '-hide_banner', '-nostdin', '-i', path, '-map', '0:v:0', '-f', 'null', '-'],
+	                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode(errors='replace')
+	counts = re.findall(r'frame=\s*(\d+)', out)
+	return int(counts[-1]) if counts else None
 
 
 def save(img, name):
@@ -163,6 +176,54 @@ try:
 	except RuntimeError as e:
 		check('validate rejects unsafe expressions', 'only these functions' in str(e) or 'not allowed' in str(e), e)
 
+	# --- snapshots: move things, then put them back --------------------------
+	def label_state():
+		n = j(S.node_info('label'))
+		return n['pos'], n['visible']
+	pos0, vis0 = label_state()
+	S.run_code('tmp_box = vizshape.addBox(size=[0.1, 0.1, 0.1])')
+	snap_file = os.path.join(OUT, 'live_snapshot.json')
+	sv = j(S.snapshot_save('live', nodes=['label', 'beam', 'tmp_box'], state='table.rate_deg_s',
+	                       restore_code='table.rate_deg_s = _state', path=snap_file))
+	check('snapshot_save', sv['nodes'] == 3 and os.path.isfile(snap_file) and [r['name'] for r in j(S.snapshot_list())['snapshots']] == ['live'], sv)
+	check('snapshot_list reads the file without the app', j(S.snapshot_list(path=snap_file))['nodes'] == 3)
+	S.set_node('label', position=[3, 5, 1], visible=False)
+	S.run_code('table.rate_deg_s = 90.0')
+	S.run_code('tmp_box.remove()\ndel tmp_box')
+	S.wait(frames=3)
+	moved_pos, moved_vis = label_state()
+	check('snapshot: the node really was moved first', abs(moved_pos[0] - 3) < 1e-3 and moved_vis is False, (moved_pos, moved_vis))
+	rs = j(S.snapshot_restore('live'))
+	pos1, vis1 = label_state()
+	check('snapshot_restore: position, visibility and state are back',
+	      all(abs(a - b) < 1e-4 for a, b in zip(pos0, pos1)) and vis1 == vis0 == True
+	      and j(S.run_code('table.rate_deg_s'))['value'] == '30.0' and rs['state'] == {'restored': True}, (pos0, pos1, rs.get('state')))
+	check('snapshot_restore reports the node that was deleted',
+	      rs['restored'] == 2 and [m['ref'] for m in rs['missing']] == ['tmp_box'] and not rs['failed'], rs)
+	S.set_node('label', position=[-4, 1, 1])
+	S.run_code('table.rate_deg_s = 45.0')
+	rf = j(S.snapshot_restore(path=snap_file))
+	check('snapshot_restore from the JSON file', rf['restored'] == 2 and label_state()[0] == pos0
+	      and j(S.run_code('table.rate_deg_s'))['value'] == '30.0', rf)
+
+	# --- report: a watch, a validate and a screenshot in one HTML file ---------
+	rep_path = os.path.join(OUT, 'live_report.html')
+	rep = j(S.make_report([
+		{'type': 'heading', 'text': 'Bouncing ball'},
+		{'type': 'text', 'text': 'Dropped from **2 m**, e = 0.8.'},
+		{'type': 'watch', 'name': 'bounce', 'columns': ['h']},
+		{'type': 'validate', 'watch': 'bounce', 'measured': 'h', 'theory': 'h0 - v**2/(2*g)',
+		 'constants': {'h0': 2.0, 'g': 9.81}, 'abs_tol': 0.02, 't_max': 0.5},
+		{'type': 'screenshot', 'caption': 'The scene'},
+		{'type': 'keyvalue', 'items': {'Restitution': 0.8}}], path=rep_path, title='Live check report'))
+	with open(rep_path, encoding='utf-8') as f:
+		page = f.read()
+	check('make_report: file with 3 inline images, a PASS badge and the header',
+	      rep['images'] == 3 and page.count('data:image/') == 3 and 'badge pass">PASS' in page
+	      and 'Zarrar Abbas' in page and 'demo_scene.py' in page and os.path.getsize(rep_path) > 20000,
+	      (rep['images'], rep['bytes'], rep['all_validations_passed']))
+	check('make_report: validations summarised', rep['all_validations_passed'] is True, rep['validations'])
+
 	# --- seeing ------------------------------------------------------------
 	shot = S.screenshot(max_size=800, annotate=True, save_to=os.path.join(OUT, 'demo.png'))
 	save(shot[0], 'demo_annotated.jpg')
@@ -215,6 +276,19 @@ try:
 	ok, detail = plays_as_h264(fly['path'])
 	check('record_tour keyframes mp4 plays (h264)', fly.get('mp4_converted') and ok and fly['duration'] == 3, fly.get('mp4_error') or detail)
 	check('record_tour restores the camera (keyframes)', j(S.camera()) == cam_before)
+
+	# mode "steps": every output frame is a captured PNG, so the video has exactly fps x duration frames
+	# however slowly the scene renders. The camera must come back, and the PNGs must be gone.
+	st = j(S.record_tour(orbit='turntable', duration=2, degrees=180, mode='steps', fps=30,
+	                     path=os.path.join(OUT, 'steps_tour.mp4')))
+	ok, detail = plays_as_h264(st['path'])
+	check('record_tour steps mp4 plays (h264)', st.get('mp4_converted') and ok, st.get('mp4_error') or detail)
+	n_video = video_frames(st['path'])
+	check('record_tour steps: the MP4 has fps x 2 = 60 frames', st['frames'] == 60 and n_video == 60, (st['frames'], n_video))
+	check('record_tour steps: PNGs deleted, camera restored',
+	      st.get('frames_deleted') is True and j(S.camera()) == cam_before and not j(S.vizard_status()).get('camera_held'),
+	      (st.get('frames_deleted'), cam_before, j(S.camera())))
+	info('record_tour steps', {k: st.get(k) for k in ('frames', 'wall_s', 'wall_s_per_frame', 'bytes', 'window_size')})
 
 	# --- driving -----------------------------------------------------------
 	j(S.send_key(' ', hold_frames=3))

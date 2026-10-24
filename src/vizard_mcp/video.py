@@ -60,10 +60,34 @@ def convert_to_mp4(src, dst, crf=23, fps=None, max_size=None, timeout_s=900.0):
 	found = find_ffmpeg()
 	if found is None:
 		raise VideoError(NO_FFMPEG)
-	ffmpeg, source = found
 	if not os.path.isfile(src) or os.path.getsize(src) == 0:
 		raise VideoError('the recording %s is missing or empty' % src)
-	cmd = build_command(ffmpeg, src, dst, crf, fps, max_size)
+	return _run(found, build_command(found[0], src, dst, crf, fps, max_size), dst, timeout_s)
+
+
+def build_sequence_command(ffmpeg, pattern, dst, fps, crf=23, max_size=None):
+	"""The ffmpeg command line for a numbered image sequence (e.g. frame_%05d.png) played at
+	`fps`: H.264, yuv420p, even dimensions, moov atom first."""
+	cmd = build_command(ffmpeg, pattern, dst, crf, None, max_size)
+	i = cmd.index('-i')
+	return cmd[:i] + ['-framerate', '%g' % fps] + cmd[i:]
+
+
+def encode_sequence(folder, pattern, dst, fps, crf=23, max_size=None, timeout_s=1800.0):
+	"""Encode the numbered frames `folder`/`pattern` (printf style, e.g. frame_%05d.png) to an
+	MP4 at `fps`. Same result and failure behaviour as convert_to_mp4; the frames are untouched."""
+	found = find_ffmpeg()
+	if found is None:
+		raise VideoError(NO_FFMPEG)
+	first = os.path.join(folder, pattern % 0)
+	if not os.path.isfile(first):
+		raise VideoError('no frames to encode: %s is missing' % first)
+	cmd = build_sequence_command(found[0], os.path.join(folder, pattern), dst, fps, crf, max_size)
+	return _run(found, cmd, dst, timeout_s)
+
+
+def _run(found, cmd, dst, timeout_s):
+	ffmpeg, source = found
 	try:
 		proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
 		                      stderr=subprocess.PIPE, timeout=timeout_s)

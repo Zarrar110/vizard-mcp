@@ -30,6 +30,7 @@ Unofficial community project. Not affiliated with or endorsed by WorldViz.
 
 import ast
 import collections
+import copy
 import cProfile
 import csv
 import importlib
@@ -306,6 +307,7 @@ class _State(object):
 	watches = collections.OrderedDict()
 	recording = None
 	vr = None
+	snapshots = collections.OrderedDict()
 
 
 def _new_path(prefix, ext):
@@ -853,10 +855,71 @@ def _apply_pose(pose):
 		v.setEuler(pose['euler'])
 
 
+_STEP_FRAME = 'frame_%05d.png'
+_MAX_STEP_FRAMES = 100000
+
+
+def _tour_steps(path, p):
+	"""Generator: step the view along `path` one output frame at a time. For frame k the held
+	pose is the one at t = k / fps; after `settle_frames` rendered frames the window is captured
+	to a numbered PNG in a fresh folder. The server encodes the sequence. The app keeps running
+	in wall time meanwhile, so its own motion is not stepped. The view is given back afterwards."""
+	fps = float(p.get('fps') or 30.0)
+	if not 0 < fps <= 240:
+		raise ValueError('fps must be more than 0 and at most 240')
+	settle = int(p.get('settle_frames', 2))
+	if settle < 0:
+		raise ValueError('settle_frames must be 0 or more')
+	count = max(1, int(round(fps * path.duration)))
+	if count > _MAX_STEP_FRAMES:
+		raise ValueError('%d frames is too many (limit %d); lower fps or duration' % (count, _MAX_STEP_FRAMES))
+	folder = _new_path('tour', 'frames')
+	os.makedirs(folder)
+	v = viz.MainView
+	prev_apply, prev_pos, prev_eul = _State.hold_apply, v.getPosition(), v.getEuler()
+	at = {'t': 0.0}
+
+	def apply():
+		_apply_pose(path.at(at['t']))
+	sizes = []
+	t0 = time.time()
+	done = 0
+	try:
+		apply()
+		_set_hold(apply)
+		yield from _wait_frames(3)
+		for k in range(count):
+			at['t'] = k / fps
+			apply()
+			yield from _wait_frames(settle)
+			info = yield from _capture(os.path.join(folder, _STEP_FRAME % k))
+			if info['window_size'] not in sizes:
+				sizes.append(info['window_size'])
+			done += 1
+	finally:
+		_set_hold(prev_apply)
+		v.setPosition(prev_pos)
+		v.setEuler(prev_eul)
+	wall = time.time() - t0
+	res = {'mode': 'steps', 'frames_dir': folder, 'frame_pattern': _STEP_FRAME, 'frames': done, 'fps': fps,
+	       'settle_frames': settle, 'duration': path.duration, 'wall_s': round(wall, 2),
+	       'wall_s_per_frame': round(wall / max(done, 1), 3), 'window_size': sizes[0] if sizes else None,
+	       'path_kind': path.kind, 'path_description': path.description}
+	if len(sizes) > 1:
+		res['warning'] = 'the window changed size while capturing (%s); the video is scaled to the first size' % sizes
+	return res
+
+
 def cmd_record_tour(p):
 	"""Move the view along a path while recording, or (dry_run) capture a few frames along it.
-	The view is held for the duration and then given back exactly as it was."""
+	The view is held for the duration and then given back exactly as it was. With mode "steps"
+	the path is stepped frame by frame and captured to PNGs instead (see _tour_steps)."""
+	mode = p.get('mode') or 'realtime'
+	if mode not in ('realtime', 'steps'):
+		raise ValueError('mode must be "realtime" or "steps"')
 	path = _tour_path(p)
+	if mode == 'steps' and not p.get('dry_run'):
+		return (yield from _tour_steps(path, p))
 	if p.get('dry_run'):
 		count = max(2, min(12, int(p.get('count', 6))))
 		views = []
@@ -2414,6 +2477,257 @@ def cmd_validate(p):
 
 
 # ---------------------------------------------------------------------------
+# Snapshots: transforms and visibility of chosen nodes, plus optional app state
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_FORMAT = 'vizmcp-snapshot'
+_SNAPSHOT_VERSION = 1
+
+
+def _node_state(node):
+	"""Local position, quaternion, scale and visibility of a node; None for what it cannot give."""
+	d = {}
+	for key, getter in (('position', lambda: node.getPosition(viz.ABS_PARENT)),
+	                    ('quat', lambda: node.getQuat(viz.ABS_PARENT)),
+	                    ('scale', lambda: node.getScale())):
+		try:
+			d[key] = [float(a) for a in getter()]
+		except Exception:
+			d[key] = None
+	try:
+		d['visible'] = bool(node.getVisible())
+	except Exception:
+		d['visible'] = None
+	return d
+
+
+def _descendants(root, limit):
+	"""`root` and everything under it, breadth first, each node once; (nodes, truncated)."""
+	out, seen, queue_ = [], set(), collections.deque([root])
+	while queue_:
+		n = queue_.popleft()
+		if n.id in seen:
+			continue
+		if len(out) >= limit:
+			return out, True
+		seen.add(n.id)
+		out.append(n)
+		queue_.extend(n.getChildren())
+	return out, False
+
+
+def _is_id_ref(ref):
+	return isinstance(ref, int) or (isinstance(ref, str) and ref.strip().isdigit())
+
+
+def _snapshot_entries(p):
+	"""Nodes to record: the given refs, then named nodes, then everything under `root`."""
+	limit = max(1, int(p.get('max_nodes', 2000)))
+	labels = _labels()
+	entries = collections.OrderedDict()
+	truncated = False
+
+	def add(node, ref):
+		if node.id in entries:
+			return
+		if len(entries) >= limit:
+			raise _Full()
+		names = labels.get(node.id, [])
+		if ref is None:
+			ref = names[0] if names else node.id
+		kind = 'id' if _is_id_ref(ref) else 'expr'
+		entries[node.id] = dict({'ref': int(ref) if kind == 'id' else ref, 'kind': kind, 'id': node.id,
+		                         'names': list(names), 'type': type(node).__name__}, **_node_state(node))
+
+	try:
+		for ref in p.get('nodes') or []:
+			add(_resolve_node(ref), ref)
+		if p.get('named'):
+			found = cmd_find_nodes({'pattern': p.get('pattern') or '', 'limit': limit})
+			for item in found['nodes']:
+				add(viz.VizNode._GetObject(item['id']), None)
+			truncated = truncated or found['truncated']
+		if p.get('root') is not None:
+			nodes, cut = _descendants(_resolve_node(p['root']), limit)
+			for n in nodes:
+				add(n, None)
+			truncated = truncated or cut
+	except _Full:
+		truncated = True
+	return list(entries.values()), truncated
+
+
+class _Full(Exception):
+	pass
+
+
+def _snapshot_write(snap, path):
+	state = snap.get('state')
+	doc = {'format': _SNAPSHOT_FORMAT, 'version': _SNAPSHOT_VERSION, 'name': snap['name'],
+	       'created': snap['created'], 'pid': snap['pid'], 'vizard_version': snap['vizard_version'],
+	       'script': snap['script'], 'truncated': snap['truncated'], 'nodes': snap['nodes'], 'state': None}
+	if state:
+		doc['state'] = {'expression': state['expression'], 'restore_code': state['restore_code'],
+		                'value': state['json'], 'value_exact': state['json_exact'], 'repr': state['repr']}
+	os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+	with open(path, 'w', encoding='utf-8') as f:
+		json.dump(doc, f, indent=1)
+	return path
+
+
+def _snapshot_read(path):
+	with open(path, 'r', encoding='utf-8') as f:
+		doc = json.load(f)
+	if not isinstance(doc, dict) or doc.get('format') != _SNAPSHOT_FORMAT:
+		raise ValueError('%s is not a vizmcp snapshot file' % path)
+	if doc.get('version') != _SNAPSHOT_VERSION:
+		raise ValueError('%s is snapshot version %r; this vizmcp reads version %d' % (path, doc.get('version'), _SNAPSHOT_VERSION))
+	snap = {k: doc.get(k) for k in ('name', 'created', 'pid', 'vizard_version', 'script', 'nodes')}
+	snap['truncated'] = bool(doc.get('truncated'))
+	st = doc.get('state')
+	if st:
+		snap['state'] = {'expression': st.get('expression'), 'restore_code': st.get('restore_code'),
+		                 'json': st.get('value'), 'json_exact': bool(st.get('value_exact')), 'repr': st.get('repr')}
+	return snap
+
+
+def _snapshot_summary(snap):
+	st = snap.get('state')
+	return {'name': snap['name'], 'created': snap['created'], 'nodes': len(snap['nodes']),
+	        'truncated': snap['truncated'], 'state_expression': st['expression'] if st else None,
+	        'restore_code': bool(st and st['restore_code']), 'file': snap.get('file'),
+	        'same_app': snap['pid'] == os.getpid()}
+
+
+def cmd_snapshot_save(p):
+	"""Record the transforms and visibility of chosen nodes (and optionally app state) under a name."""
+	name = p.get('name')
+	if not name or not isinstance(name, str):
+		raise ValueError('name is required')
+	state_expr = p.get('state')
+	if not (p.get('nodes') or p.get('named') or p.get('root') is not None or state_expr):
+		raise ValueError('give nodes, named, root or state: nothing to record')
+	if p.get('restore_code') and not state_expr:
+		raise ValueError('restore_code needs state (an expression that returns the value to keep)')
+	nodes, truncated = _snapshot_entries(p)
+	snap = {'name': name, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'), 'pid': os.getpid(),
+	        'vizard_version': viz.version(), 'script': getattr(sys.modules['__main__'], '__file__', None),
+	        'truncated': truncated, 'nodes': nodes}
+	if state_expr:
+		raw = _eval(state_expr)
+		try:
+			kept = copy.deepcopy(raw)
+		except Exception as e:
+			raise ValueError('the value of state %r cannot be copied (%s: %s); return plain data such as '
+			                 'numbers, lists and dicts' % (state_expr, type(e).__name__, e))
+		try:
+			dumped = json.loads(json.dumps(raw))
+			exact = True
+		except (TypeError, ValueError):
+			dumped, exact = None, False
+		snap['state'] = {'expression': state_expr, 'restore_code': p.get('restore_code'), 'value': kept,
+		                 'json': dumped, 'json_exact': exact, 'repr': _clip(repr(raw), 2000)}
+	if p.get('path'):
+		snap['file'] = _snapshot_write(snap, os.path.abspath(p['path']))
+	_State.snapshots[name] = snap
+	res = _snapshot_summary(snap)
+	if state_expr and not snap['state']['json_exact']:
+		res['note'] = ('the state value is not JSON data: it is kept in the app for snapshot_restore, but a '
+		               'file holds only its repr and cannot restore it')
+	return res
+
+
+def _snapshot_resolve(entry, same_app):
+	"""(node, None) or (None, reason) for one recorded node."""
+	reason = None
+	if entry['kind'] == 'expr':
+		try:
+			return _resolve_node(entry['ref']), None
+		except Exception as e:
+			reason = '%s: %s' % (type(e).__name__, e)
+	elif not same_app:
+		return None, 'node id %s is from another Vizard session' % entry['ref']
+	if same_app and entry.get('id') is not None:
+		try:
+			return _resolve_node(entry['id']), None
+		except Exception as e:
+			reason = reason or '%s: %s' % (type(e).__name__, e)
+	return None, reason
+
+
+def cmd_snapshot_restore(p):
+	"""Put a snapshot back: app state first (restore_code), then each node's transform and
+	visibility. Nodes that cannot be found are reported, not fatal."""
+	name, path = p.get('name'), p.get('path')
+	if not name and not path:
+		raise ValueError('give name, or path of a snapshot file')
+	if path:
+		snap = _snapshot_read(os.path.abspath(path))
+		snap['file'] = os.path.abspath(path)
+		name = name or snap['name']
+		snap['name'] = name
+		_State.snapshots[name] = snap
+	elif name not in _State.snapshots:
+		raise ValueError('no snapshot named %r (have: %s)' % (name, ', '.join(_State.snapshots) or 'none'))
+	else:
+		snap = _State.snapshots[name]
+	same_app = snap['pid'] == os.getpid()
+	res = {'name': name, 'nodes_saved': len(snap['nodes']), 'restored': 0, 'missing': [], 'failed': []}
+
+	st = snap.get('state')
+	if st:
+		code = p.get('restore_code') or st['restore_code']
+		if not code:
+			res['state'] = {'restored': False, 'reason': 'the snapshot has state but no restore_code was given'}
+		elif 'value' in st:
+			value = copy.deepcopy(st['value'])
+		elif st['json_exact']:
+			value = copy.deepcopy(st['json'])
+		else:
+			value = _MISSING
+			res['state'] = {'restored': False, 'reason': 'the state value was not JSON data and is not in this app'}
+		if code and value is not _MISSING:
+			ns = _main_ns()
+			had, old = '_state' in ns, ns.get('_state')
+			ns['_state'] = value
+			try:
+				exec(compile(code, '<vizmcp snapshot>', 'exec'), ns)
+				res['state'] = {'restored': True}
+			except Exception:
+				res['state'] = {'restored': False, 'error': _clip(traceback.format_exc(), 2000)}
+			finally:
+				if had:
+					ns['_state'] = old
+				else:
+					ns.pop('_state', None)
+
+	for e in snap['nodes']:
+		node, reason = _snapshot_resolve(e, same_app)
+		if node is None:
+			res['missing'].append({'ref': e['ref'], 'names': e.get('names', []), 'reason': reason})
+			continue
+		ok = True
+		for what, setter, value in (
+				('position', lambda v: node.setPosition(v, viz.ABS_PARENT), e.get('position')),
+				('quat', lambda v: node.setQuat(v, viz.ABS_PARENT), e.get('quat')),
+				('scale', lambda v: node.setScale(v), e.get('scale')),
+				('visible', lambda v: node.visible(bool(v)), e.get('visible'))):
+			if value is None:
+				continue
+			try:
+				setter(value)
+			except Exception as ex:
+				ok = False
+				res['failed'].append({'ref': e['ref'], 'what': what, 'error': '%s: %s' % (type(ex).__name__, ex)})
+		res['restored'] += 1 if ok else 0
+	return res
+
+
+def cmd_snapshot_list(p):
+	return {'snapshots': [_snapshot_summary(s) for s in _State.snapshots.values()]}
+
+
+# ---------------------------------------------------------------------------
 # Command table
 # ---------------------------------------------------------------------------
 
@@ -2453,6 +2767,9 @@ COMMANDS = {
 	'click_button': cmd_click_button,
 	'vr_simulate': cmd_vr_simulate,
 	'validate': cmd_validate,
+	'snapshot_save': cmd_snapshot_save,
+	'snapshot_restore': cmd_snapshot_restore,
+	'snapshot_list': cmd_snapshot_list,
 	'quit': cmd_quit,
 }
 

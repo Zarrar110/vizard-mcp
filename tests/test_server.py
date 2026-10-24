@@ -17,7 +17,7 @@ EXPECTED = {
 	'filmstrip', 'record_video', 'pick', 'project', 'camera', 'send_key', 'click', 'wait', 'wait_until',
 	'watch_start', 'watch_read', 'watch_plot', 'profile', 'call_command', 'watch_export',
 	'screenshot_diff', 'scene_stats', 'gui_list', 'click_button', 'vr_simulate', 'validate',
-	'record_tour', 'doctor'}
+	'record_tour', 'doctor', 'snapshot_save', 'snapshot_restore', 'snapshot_list', 'make_report'}
 
 
 def run(coro):
@@ -30,9 +30,9 @@ def no_app(monkeypatch):
 	monkeypatch.setitem(S._launched, 'proc', None)
 
 
-def test_all_37_tools_register_with_valid_schemas():
+def test_all_41_tools_register_with_valid_schemas():
 	tools = run(S.mcp.list_tools())
-	assert len(tools) == 37
+	assert len(tools) == 41
 	assert {t.name for t in tools} == EXPECTED
 	for t in tools:
 		assert t.description, t.name

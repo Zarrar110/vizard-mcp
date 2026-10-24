@@ -36,6 +36,12 @@ def to_jpeg(im, quality=85):
 	return buf.getvalue()
 
 
+def to_png(im):
+	buf = io.BytesIO()
+	im.save(buf, 'PNG')
+	return buf.getvalue()
+
+
 def _text_box(draw, xy, text, font, fg=(255, 255, 255), bg=(0, 0, 0, 170), anchor='la'):
 	x, y = xy
 	l, t, r, b = draw.textbbox((x, y), text, font=font, anchor=anchor)
