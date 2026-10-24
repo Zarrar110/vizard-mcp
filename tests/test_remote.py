@@ -291,6 +291,30 @@ def test_launched_app_only_gets_vizmcp_bind_when_there_is_a_token(monkeypatch, t
 		assert seen['env'].get('VIZMCP_TOKEN') == token
 
 
+
+def test_a_token_given_in_env_is_used_by_the_server_too(monkeypatch, tmp_path):
+	"""launch_app(env={"VIZMCP_TOKEN": ...}): the app will demand it, so the client must send it."""
+	import subprocess
+
+	class Stop(Exception):
+		pass
+
+	seen = {}
+
+	def popen(cmd, **kw):
+		seen['env'] = kw['env']
+		raise Stop()
+	monkeypatch.setattr(subprocess, 'Popen', popen)
+	monkeypatch.setattr(S, 'find_winviz', lambda: 'winviz.exe')
+	monkeypatch.setattr(S, 'client', VizardClient(port=free_port(), token=None))
+	script = tmp_path / 'app.py'
+	script.write_text('pass')
+	with pytest.raises(Stop):
+		S.launch_app(str(script), env={'VIZMCP_BIND': '0.0.0.0', 'VIZMCP_TOKEN': 's3cret'})
+	assert S.client.token == 's3cret'
+	assert seen['env']['VIZMCP_TOKEN'] == 's3cret' and seen['env']['VIZMCP_BIND'] == '0.0.0.0'
+
+
 # --- doctor ------------------------------------------------------------------------------
 
 @pytest.fixture

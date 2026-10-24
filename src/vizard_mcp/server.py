@@ -212,6 +212,10 @@ def launch_app(script: str, args: list[str] | None = None, env: dict[str, str] |
 	log_path = os.path.join(tempfile.gettempdir(), 'vizmcp_launch_%d.log' % int(time.time()))
 	child_env = dict(os.environ)
 	child_env.update(env or {})
+	if (env or {}).get('VIZMCP_TOKEN') and env['VIZMCP_TOKEN'] != client.token:
+		# The app will demand this token, so talk to it with the same one (else every call,
+		# the startup ping included, is refused and launch_app waits out its timeout).
+		client.configure(token=env["VIZMCP_TOKEN"])
 	child_env['VIZMCP_TARGET'] = script
 	child_env['VIZMCP_PORT'] = str(client.port)
 	if client.token:
