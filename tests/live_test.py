@@ -3,12 +3,18 @@ the MCP tool functions, exercises every tool, checks the physics the demo
 simulates, and quits the app.
 
     python tests/live_test.py
+
+Needs a real Vizard install. Under pytest it is skipped unless VIZMCP_LIVE=1.
 """
 
 import csv
 import json
 import os
 import sys
+
+if __name__ != '__main__' and os.environ.get('VIZMCP_LIVE') != '1':
+	import pytest
+	pytest.skip('needs a real Vizard install; set VIZMCP_LIVE=1 to run', allow_module_level=True)
 
 from vizard_mcp import server as S
 
@@ -162,4 +168,6 @@ finally:
 	print('QUIT', S.quit_app())
 
 print('FAILURES', failures)
-sys.exit(1 if failures else 0)
+if __name__ == '__main__':
+	sys.exit(1 if failures else 0)
+assert not failures, failures

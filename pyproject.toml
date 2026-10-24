@@ -11,10 +11,6 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Zarrar Abbas", email = "zarrarabbas73@gmail.com" }]
-
-[project.urls]
-Homepage = "https://github.com/Zarrar110/vizard-mcp"
-Issues = "https://github.com/Zarrar110/vizard-mcp/issues"
 keywords = ["mcp", "vizard", "worldviz", "vr", "virtual-reality", "claude"]
 classifiers = [
     "Operating System :: Microsoft :: Windows",
@@ -23,8 +19,17 @@ classifiers = [
 ]
 dependencies = ["mcp>=2.3,<3", "pillow>=10"]
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/Zarrar110/vizard-mcp"
+Issues = "https://github.com/Zarrar110/vizard-mcp/issues"
+
 [project.scripts]
 vizard-mcp = "vizard_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vizard_mcp"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

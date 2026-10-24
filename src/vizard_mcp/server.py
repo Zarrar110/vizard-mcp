@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__, api_index, imaging
 from .client import NotConnected, VizardClient, VizardError
@@ -44,6 +45,12 @@ Vizard is Y-up and left-handed; euler is [yaw, pitch, roll] in degrees.
 Vizard's free licence allows only one Vizard process at a time.
 """
 
+class VizardToolError(ToolError, RuntimeError):
+	"""A tool failure. ToolError makes the SDK send the message to the client
+	(any other exception is reduced to "Error executing tool X"); RuntimeError keeps
+	the type callers of the tool functions have always seen."""
+
+
 mcp = MCPServer('vizard-mcp', instructions=INSTRUCTIONS)
 client = VizardClient()
 _launched = {'proc': None, 'log': None}
@@ -59,9 +66,9 @@ def _call(cmd, wait_s=None, **params):
 	try:
 		return client.call(cmd, timeout=timeout, **params)
 	except NotConnected as e:
-		raise RuntimeError(str(e))
+		raise VizardToolError(str(e))
 	except VizardError as e:
-		raise RuntimeError('Vizard reported an error:\n%s' % e)
+		raise VizardToolError('Vizard reported an error:\n%s' % e)
 
 
 def _dump(x):
@@ -86,7 +93,7 @@ def find_winviz():
 	for root in roots:
 		found += glob.glob(os.path.join(root, 'WorldViz', 'Vizard*', 'bin', 'winviz.exe'))
 	if not found:
-		raise RuntimeError('winviz.exe not found. Set the VIZARD_EXE environment variable to its full path.')
+		raise VizardToolError('winviz.exe not found. Set the VIZARD_EXE environment variable to its full path.')
 	return sorted(found)[-1]
 
 
@@ -127,10 +134,10 @@ def launch_app(script: str, args: list[str] | None = None, env: dict[str, str] |
 	"""
 	script = os.path.abspath(script)
 	if not os.path.isfile(script):
-		raise RuntimeError('No such script: %s' % script)
+		raise VizardToolError('No such script: %s' % script)
 	if client.ping():
 		if not restart:
-			raise RuntimeError('A Vizard app is already connected. Pass restart=true to replace it, '
+			raise VizardToolError('A Vizard app is already connected. Pass restart=true to replace it, '
 			                   'or call quit_app first.')
 		quit_app()
 
@@ -160,7 +167,7 @@ def launch_app(script: str, args: list[str] | None = None, env: dict[str, str] |
 			if code == 1 and time.time() - t0 < 5:
 				hint = ('\nVizard exited almost at once. With the free licence this happens when '
 				        'another Vizard script or the Vizard IDE is already running a script.')
-			raise RuntimeError('winviz.exe exited with code %s.%s\nLog (%s):\n%s'
+			raise VizardToolError('winviz.exe exited with code %s.%s\nLog (%s):\n%s'
 			                   % (code, hint, log_path, _tail(log_path)))
 		if client.ping():
 			info = _call('info')
@@ -168,7 +175,7 @@ def launch_app(script: str, args: list[str] | None = None, env: dict[str, str] |
 			info.update(pid=proc.pid, startup_s=round(time.time() - t0, 1), launch_log=log_path)
 			return _dump(info)
 		time.sleep(0.5)
-	raise RuntimeError('The app did not answer within %ds (it may be waiting in a dialog, e.g. a '
+	raise VizardToolError('The app did not answer within %ds (it may be waiting in a dialog, e.g. a '
 	                   'hardware selection window). Process is still running (pid %d). Log:\n%s'
 	                   % (timeout_s, proc.pid, _tail(log_path)))
 
@@ -178,7 +185,7 @@ def quit_app(timeout_s: float = 20.0) -> str:
 	"""Ask the connected Vizard app to close, and wait for it to go away."""
 	try:
 		_call('quit')
-	except RuntimeError as e:
+	except VizardToolError as e:
 		if 'No Vizard app' in str(e):
 			return 'No app was running.'
 		raise
@@ -299,7 +306,7 @@ def vizard_api(query: str = '', name: str | None = None, limit: int = 30) -> str
 		return '\n\n'.join('%s%s  [%s]\n%s:%d\n%s' % (e['name'], e['signature'], e['kind'], e['file'],
 		                                             e['line'], e['doc'] or '(no docstring)') for e in hits)
 	if not query:
-		raise RuntimeError('Give query or name.')
+		raise VizardToolError('Give query or name.')
 	hits = api_index.search(root, query, limit=limit)
 	if not hits:
 		return 'No matches for %r.' % query
@@ -347,7 +354,7 @@ def multi_view(orbit: str | None = None, target: list[float] | None = None, radi
 	views: explicit list of {"position": [x,y,z], "look_at": [x,y,z]} or
 	       {"position", "euler"}, instead of an orbit."""
 	if orbit is None and target is None and not views:
-		raise RuntimeError('Give orbit, target or views.')
+		raise VizardToolError('Give orbit, target or views.')
 	n = len(views) if views else count
 	res = _call('multi_view', wait_s=20 + 5 * n, orbit=orbit, target=target, radius=radius,
 	            count=count, elevation_deg=elevation_deg, distance=distance,
@@ -483,11 +490,11 @@ def watch_plot(name: str, columns: list[str] | None = None, title: str | None = 
 	res = _call('watch_read', name=name, max_points=1500)
 	cols = res['columns']
 	if not res.get('samples'):
-		raise RuntimeError('watch %r has no samples yet' % name)
+		raise VizardToolError('watch %r has no samples yet' % name)
 	want = columns or cols[2:]
 	missing = [c for c in want if c not in cols]
 	if missing:
-		raise RuntimeError('unknown columns %s; have %s' % (missing, cols[2:]))
+		raise VizardToolError('unknown columns %s; have %s' % (missing, cols[2:]))
 	t = [r[0] for r in res['samples']]
 	series = [(c, [r[cols.index(c)] for r in res['samples']]) for c in want]
 	im = imaging.line_chart(title or 'watch "%s"' % name, t, series)
