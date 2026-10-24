@@ -77,12 +77,20 @@ def default_command():
 	return os.path.abspath(sys.executable), ['-m', 'vizard_mcp']
 
 
+def _same_path(a, b):
+	if not isinstance(a, str) or not isinstance(b, str):
+		return False
+	norm = lambda p: os.path.normcase(os.path.normpath(p.replace('/', os.sep).replace('\\', os.sep)))
+	return norm(a) == norm(b)
+
+
 def wanted_entry(target, command, args, existing=None):
 	"""The server entry to store. Keys the user added to an existing entry (env, ...) are kept."""
 	entry = dict(existing) if isinstance(existing, dict) else {}
 	if target == 'claude-code':
 		entry['type'] = 'stdio'
-	entry['command'] = command
+	if not _same_path(entry.get('command'), command):     # C:/x and C:\x are the same program
+		entry['command'] = command
 	entry['args'] = list(args)
 	if target == 'claude-code':
 		entry.setdefault('env', {})

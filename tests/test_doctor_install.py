@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -282,7 +283,11 @@ def test_doctor_runs_as_a_subprocess_without_importing_the_server(home, tmp_path
 	         "    print('EXIT', e.code)\n")
 	out = subprocess.run([sys.executable, '-c', probe], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
 	text = out.stdout.decode()
-	assert 'vizard-mcp 1.0.0 doctor' in text and 'EXIT 1' in text, out.stderr.decode()
+	# The exit code depends on the machine (a child process on Windows still finds a real
+	# Vizard install, since environment names there ignore case); the in-process test above
+	# covers it. Here it only matters that the doctor ran to the end without mcp.
+	assert 'vizard-mcp 1.0.0 doctor' in text and re.search(r'EXIT [01]\b', text), out.stderr.decode()
+	assert 'Traceback' not in out.stderr.decode()
 
 
 # ============================== install ===================================================
@@ -439,3 +444,10 @@ def test_cli_unknown_subcommand_and_help(capsys):
 def test_cli_copy_module(tmp_path, capsys):
 	cli.main(['copy-module', str(tmp_path)])
 	assert (tmp_path / 'vizmcp.py').exists()
+
+
+def test_install_treats_slash_styles_of_the_same_path_as_unchanged():
+	have = {'type': 'stdio', 'command': 'C:/VizardMCP/.venv/Scripts/vizard-mcp.exe', 'args': [], 'env': {}}
+	cmd = (r'C:\VizardMCP\.venv\Scripts\vizard-mcp.exe' if os.name == 'nt'
+	       else 'C:/VizardMCP/.venv/Scripts/vizard-mcp.exe')
+	assert install.wanted_entry('claude-code', cmd, [], have) == have
