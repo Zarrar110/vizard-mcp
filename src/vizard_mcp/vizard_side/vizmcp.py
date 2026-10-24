@@ -37,6 +37,7 @@ import inspect
 import io
 import json
 import math
+import operator
 import os
 import pstats
 import queue
@@ -144,7 +145,7 @@ def _jsonable(x, depth=0):
 	if isinstance(x, float):
 		if x != x or x in (float('inf'), float('-inf')):
 			return repr(x)
-		return round(x, 6)
+		return float('%.9g' % x)     # keeps small residuals (1e-7 m) that round(x, 6) would zero
 	if isinstance(x, (list, tuple)):
 		return [_jsonable(v, depth + 1) for v in x]
 	if isinstance(x, dict):
@@ -303,6 +304,7 @@ class _State(object):
 	quit_requested = False
 	watches = collections.OrderedDict()
 	recording = None
+	vr = None
 
 
 def _new_path(prefix, ext):
@@ -513,6 +515,7 @@ def cmd_get_log(p):
 
 
 def cmd_quit(p):
+	_vr_restore()
 	_State.quit_requested = True
 	return {'quitting': True}
 
@@ -1405,6 +1408,718 @@ def cmd_scene_stats(p):
 
 
 # ---------------------------------------------------------------------------
+# 2D GUI: listing widgets and clicking them by label
+# ---------------------------------------------------------------------------
+
+# Widget classes by lower-case name. Anything else that derives from Vizard's GUI base
+# classes is still listed, under its own class name.
+_GUI_CLASS_KINDS = {
+	'vizbutton': 'button', 'vizcheckbox': 'checkbox', 'vizradiobutton': 'radio',
+	'vizslider': 'slider', 'viztextbox': 'textbox', 'viztext': 'label',
+	'vizprogressbar': 'progress', 'vizdroplist': 'dropdown', 'vizpanel': 'panel',
+	'vizguicanvas': 'canvas',
+}
+_NOT_CLICKABLE = ('label', 'panel', 'canvas', 'progress')
+_TEXT_GETTERS = ('getMessage', 'getText', 'getLabel')
+_ENABLED_GETTERS = ('getEnabled', 'getEnable', 'isEnabled')
+_VALUE_KINDS = ('slider', 'checkbox', 'radio', 'textbox', 'dropdown')
+_VALUE_GETTERS = ('getState', 'get', 'getValue')
+
+
+def _gui_kind(node):
+	name = type(node).__name__.lower()
+	if name in _GUI_CLASS_KINDS:
+		return _GUI_CLASS_KINDS[name]
+	if _SCREEN_TYPES and isinstance(node, _SCREEN_TYPES):
+		for frag, kind in (('radio', 'radio'), ('check', 'checkbox'), ('button', 'button'),
+		                   ('slider', 'slider'), ('textbox', 'textbox'), ('canvas', 'canvas')):
+			if frag in name:
+				return kind
+		return name
+	return None
+
+
+def _gui_place(node, world_roots):
+	"""('world' | 'screen', visible). A widget under a node of the 3D scene (a panel on a
+	vizconnect wrist or tablet, a world-space canvas) is 'world'; visible means it and every
+	ancestor are visible."""
+	cur, visible = node, True
+	for _ in range(64):
+		if not cur.getVisible():
+			visible = False
+		if cur.id in world_roots:
+			return 'world', visible
+		parents = cur.getParents()
+		if not parents:
+			return 'screen', visible
+		cur = parents[0]
+	return 'screen', visible
+
+
+def _gui_geometry(node):
+	"""Center and size in window coordinates, 0..1 from the top-left. Vizard's own 2D
+	coordinates (GUI bounding boxes) have their origin at the bottom-left."""
+	try:
+		bb = node.getBoundingBox()
+		if not bb.valid():
+			return None
+		c = bb.center
+		return {'center': [round(c[0], 4), round(1.0 - c[1], 4)],
+		        'size': [round(bb.xmax - bb.xmin, 4), round(bb.ymax - bb.ymin, 4)]}
+	except Exception:
+		return None
+
+
+def _gui_widgets():
+	"""(screen_widgets, world_widgets): dicts describing every 2D GUI widget in the app."""
+	labels = _labels()
+	nodes = {}
+	getlist = getattr(viz, 'getNodeList', None)
+	for n in (getlist() if getlist else []):
+		nodes[n.id] = n
+	for nid in labels:
+		if nid not in nodes:
+			node = viz.VizNode._GetObject(nid)
+			if node is not None and node.valid():
+				nodes[nid] = node
+	world_roots = set(n.id for n in viz.MainScene.getChildren())
+	screen, world = [], []
+	for nid in sorted(nodes):
+		node = nodes[nid]
+		kind = _gui_kind(node)
+		if kind is None or not node.valid():
+			continue
+		place, visible = _gui_place(node, world_roots)
+		is_gui = bool(_SCREEN_TYPES) and isinstance(node, _SCREEN_TYPES)
+		text, _ = _try_accessors(node, _TEXT_GETTERS)
+		text = text if isinstance(text, str) else None
+		enabled, _ = _try_accessors(node, _ENABLED_GETTERS)
+		w = {'id': nid, 'names': labels.get(nid, []), 'type': type(node).__name__, 'kind': kind,
+		     'text': text, 'visible': visible, 'enabled': enabled if isinstance(enabled, bool) else None}
+		if kind in _VALUE_KINDS:
+			value, _ = _try_accessors(node, _VALUE_GETTERS)
+			if value is not None:
+				w['value'] = _jsonable(value)
+		if place == 'screen':
+			geo = _gui_geometry(node)
+			w['center'], w['size'] = (geo['center'], geo['size']) if geo else (None, None)
+			c = w['center']
+			w['on_screen'] = bool(c) and 0.0 <= c[0] <= 1.0 and 0.0 <= c[1] <= 1.0
+			screen.append(w)
+		elif is_gui or kind != 'label':      # 3D text is not a GUI widget
+			w['world_position'] = _jsonable(node.getPosition(viz.ABS_GLOBAL))
+			world.append(w)
+	return screen, world
+
+
+def cmd_gui_list(p):
+	"""The app's 2D GUI widgets with text, state and window position (0..1, top-left
+	origin, same as screenshots). Widgets in the 3D scene are listed apart and cannot be clicked."""
+	screen, world = _gui_widgets()
+	kinds = p.get('kinds')
+	if kinds:
+		screen = [w for w in screen if w['kind'] in kinds]
+		world = [w for w in world if w['kind'] in kinds]
+	if p.get('visible_only'):
+		screen = [w for w in screen if w['visible']]
+		world = [w for w in world if w['visible']]
+	return {'widgets': screen, 'world_widgets': world,
+	        'notes': ['center and size are fractions of the window, origin top-left',
+	                  'world_widgets are parented into the 3D scene (e.g. a vizconnect wrist/tablet panel): '
+	                  'they are reported, not clickable']}
+
+
+def _gui_match(candidates, label):
+	"""Widgets whose text equals label; else equals it ignoring case; else contains it ignoring case."""
+	low = label.lower()
+	for test in (lambda t: t == label, lambda t: t.lower() == low, lambda t: low in t.lower()):
+		hits = [w for w in candidates if w['text'] and test(w['text'])]
+		if hits:
+			return hits
+	return []
+
+
+def _gui_brief(ws):
+	return '; '.join('id %d %s %r%s' % (w['id'], w['kind'], w['text'] or '',
+	                                    '' if w['visible'] else ' (hidden)') for w in ws) or 'none'
+
+
+def cmd_click_button(p):
+	"""Click the visible, enabled 2D widget whose text matches `label`, or has id `id`."""
+	label, wid = p.get('label'), p.get('id')
+	if label is None and wid is None:
+		raise ValueError('give label or id')
+	screen, world = _gui_widgets()
+	if wid is not None:
+		wid = int(wid)
+		pool = [w for w in screen if w['id'] == wid]
+		if not pool:
+			if any(w['id'] == wid for w in world):
+				raise ValueError('widget %d is in the 3D scene (world-space panel); only 2D screen '
+				                 'widgets can be clicked' % wid)
+			raise ValueError('no 2D widget with id %d; widgets: %s' % (wid, _gui_brief(screen)))
+	else:
+		pool = [w for w in screen if w['kind'] not in _NOT_CLICKABLE]
+	# Hidden or disabled widgets never shadow a usable match.
+	usable = [w for w in pool if w['visible'] and w['enabled'] is not False and w['on_screen']]
+	if wid is None:
+		usable = _gui_match(usable, str(label))
+		if not usable:
+			unusable = _gui_match([w for w in pool if w not in usable], str(label))
+			if unusable:
+				raise ValueError('widget(s) %s match but are hidden, disabled or off screen' % _gui_brief(unusable))
+			raise ValueError('no widget with text matching %r; candidates: %s' % (label, _gui_brief(pool)))
+	elif not usable:
+		raise ValueError('widget(s) %s match but are hidden, disabled or off screen' % _gui_brief(pool))
+	if len(usable) > 1:
+		raise ValueError('%r is ambiguous, pass id. Matches: %s' % (label, _gui_brief(usable)))
+	w = usable[0]
+	x, y = w['center']
+	res = yield from cmd_click({'x': min(1.0, max(0.0, x)), 'y': min(1.0, max(0.0, y)),
+	                            'button': p.get('button', 'left'), 'double': p.get('double', False)})
+	return {'widget': w, 'click': res}
+
+
+# ---------------------------------------------------------------------------
+# vizconnect without a headset
+# ---------------------------------------------------------------------------
+
+_MISSING = object()
+_POSE_METHODS = ('getPosition', 'getEuler', 'getQuat', 'getMatrix')
+_BUTTON_METHODS = ('isButtonDown', 'isButtonUp', 'getButtonState')
+
+
+def _is_hand(n, side):
+	return side in n and any(k in n for k in ('hand', 'wrist', 'controller', 'touch', 'wand')) or n in (side, side[0])
+
+
+_VR_ALIASES = {
+	'head': lambda n: 'head' in n or 'hmd' in n,
+	'left_hand': lambda n: _is_hand(n, 'left'),
+	'right_hand': lambda n: _is_hand(n, 'right'),
+	'left': lambda n: 'left' in n,
+	'right': lambda n: 'right' in n,
+}
+
+
+def _vr_resolve(table, wanted, what):
+	"""Key of `table` (vizconnect name -> object) for an exact name, a case-insensitive
+	name, or the alias head / left_hand / right_hand."""
+	names = [str(k) for k in table]
+	wanted = str(wanted)
+	hits = [n for n in names if n == wanted] or [n for n in names if n.lower() == wanted.lower()]
+	if not hits:
+		pred = _VR_ALIASES.get(wanted.lower().replace('-', '_').replace(' ', '_'))
+		hits = [n for n in names if pred(n.lower())] if pred else []
+	if len(hits) != 1:
+		raise ValueError('%s %r %s; vizconnect has: %s' % (
+			what, wanted, 'is ambiguous' if hits else 'not found', ', '.join(names) or 'none'))
+	return hits[0]
+
+
+def _vr_token(b):
+	if isinstance(b, bool):
+		raise ValueError('button must be a name or an index, got %r' % (b,))
+	if isinstance(b, int) or (isinstance(b, str) and b.strip().isdigit()):
+		return int(b)
+	return str(b).strip().lower()
+
+
+def _vr_matrix(pose):
+	m = viz.Matrix()
+	m.setEuler(pose['euler'])
+	m.setPosition(pose['position'])
+	return m
+
+
+class _VrObject(object):
+	"""A vizconnect tracker or input whose methods are replaced on the instance."""
+
+	def __init__(self, key, obj):
+		self.key, self.obj, self.saved = key, obj, {}
+		self.pose = None
+		self.down = {}      # token -> set of equivalent tokens (its name and mapped index)
+
+	def override(self, name, func):
+		d = getattr(self.obj, '__dict__', None)
+		if d is None:
+			raise ValueError('cannot override %s on %s: no instance dict' % (name, type(self.obj).__name__))
+		if name not in self.saved:
+			self.saved[name] = d[name] if name in d else _MISSING
+		setattr(self.obj, name, func)
+
+	def restore(self):
+		for name, old in list(self.saved.items()):
+			try:
+				if old is _MISSING:
+					delattr(self.obj, name)
+				else:
+					setattr(self.obj, name, old)
+			except Exception:
+				pass
+		self.saved = {}
+
+	def call_original(self, name, *a, **k):
+		"""The method as it was before the override: an instance attribute the object had,
+		else the class's."""
+		old = self.saved.get(name, _MISSING)
+		if old is not _MISSING and callable(old):
+			return old(*a, **k)
+		return getattr(type(self.obj), name)(self.obj, *a, **k)
+
+	def equivalents(self):
+		eq = set()
+		for toks in self.down.values():
+			eq |= toks
+		return eq
+
+
+class _VrSim(object):
+	def __init__(self):
+		self.trackers = collections.OrderedDict()
+		self.inputs = collections.OrderedDict()
+		self.hold = None
+		self.apply_to_node = True
+		self.send_events = True
+		self.notes = []
+
+	def tracker(self, key, obj):
+		rec = self.trackers.get(key)
+		if rec is not None:
+			return rec
+		rec = _VrObject(key, obj)
+		pos, eul = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+		for name, dest in (('getPosition', pos), ('getEuler', eul)):
+			try:
+				dest[:] = [float(v) for v in getattr(obj, name)()]
+			except Exception:
+				pass
+		rec.pose = {'position': pos, 'euler': eul}
+		for name in _POSE_METHODS:
+			orig = getattr(obj, name, None)
+			if orig is None:
+				continue
+			if name == 'getPosition':
+				rec.override(name, lambda *a, **k: list(rec.pose['position']))
+			elif name == 'getEuler':
+				rec.override(name, lambda *a, **k: list(rec.pose['euler']))
+			elif hasattr(viz, 'Matrix'):
+				rec.override(name, _vr_derived(rec, name, orig))
+			else:
+				self.notes.append('%s: %s left unchanged (no viz.Matrix)' % (key, name))
+		self.trackers[key] = rec
+		return rec
+
+	def input(self, key, obj):
+		rec = self.inputs.get(key)
+		if rec is not None:
+			return rec
+		rec = _VrObject(key, obj)
+
+		def is_down(button, *a, **k):
+			if _vr_token(button) in rec.equivalents():
+				return True
+			try:
+				return bool(rec.call_original('isButtonDown', button, *a, **k))
+			except Exception:
+				return False
+
+		def state(*a, **k):
+			try:
+				val = rec.call_original('getButtonState', *a, **k)
+			except Exception:
+				val = None
+			ints = [t for t in rec.equivalents() if isinstance(t, int)]
+			if isinstance(val, (list, tuple)):
+				val = list(val)
+				for i in ints:
+					if 0 <= i < len(val):
+						val[i] = True
+				return val
+			mask = 0
+			for i in ints:
+				mask |= 1 << i
+			return (val or 0) | mask if isinstance(val, int) or val is None else val
+
+		if hasattr(obj, 'isButtonDown'):
+			rec.override('isButtonDown', is_down)
+		if hasattr(obj, 'isButtonUp'):
+			rec.override('isButtonUp', lambda b, *a, **k: not is_down(b, *a, **k))
+		if hasattr(obj, 'getButtonState'):
+			rec.override('getButtonState', state)
+		if not rec.saved:
+			self.notes.append('%s: has none of %s; only events are sent' % (key, ', '.join(_BUTTON_METHODS)))
+		self.inputs[key] = rec
+		return rec
+
+	def apply_nodes(self):
+		for rec in self.trackers.values():
+			try:
+				node = rec.obj.getNode3d()
+				if node is not None:
+					node.setPosition(rec.pose['position'])
+					node.setEuler(rec.pose['euler'])
+			except Exception:
+				pass
+
+	def start_hold(self):
+		if self.hold is None and self.apply_to_node:
+			self.hold = vizact.onupdate(_HOLD_PRIORITY, self.apply_nodes)
+
+	def stop_hold(self):
+		if self.hold is not None:
+			try:
+				self.hold.remove()
+			except Exception:
+				pass
+			self.hold = None
+
+	def event(self, rec, kind, token):
+		"""Tell the app a sensor button changed, as a real device would."""
+		if not self.send_events:
+			return None
+		const = getattr(viz, 'SENSOR_DOWN_EVENT' if kind == 'down' else 'SENSOR_UP_EVENT', None)
+		if const is None:
+			return 'viz has no SENSOR_%s_EVENT' % kind.upper()
+		raw = rec.obj
+		try:
+			raw = rec.obj.getRaw() or rec.obj
+		except Exception:
+			pass
+		try:
+			viz.sendEvent(const, raw, token)
+		except Exception as e:
+			return '%s: %s' % (type(e).__name__, e)
+		return None
+
+	def restore(self):
+		errors = []
+		for rec in self.inputs.values():
+			for tok in list(rec.down):
+				err = self.event(rec, 'up', tok)
+				if err:
+					errors.append(err)
+		self.stop_hold()
+		for rec in list(self.trackers.values()) + list(self.inputs.values()):
+			rec.restore()
+		self.trackers.clear()
+		self.inputs.clear()
+		return errors
+
+	def status(self):
+		return {
+			'trackers': {k: {'position': _jsonable(r.pose['position']), 'euler': _jsonable(r.pose['euler']),
+			                 'overridden': sorted(r.saved)} for k, r in self.trackers.items()},
+			'inputs': {k: {'down': sorted(map(str, r.down)), 'overridden': sorted(r.saved)}
+			           for k, r in self.inputs.items()},
+		}
+
+
+def _vr_derived(rec, name, orig):
+	def get(*a, **k):
+		try:
+			m = _vr_matrix(rec.pose)
+			return m if name == 'getMatrix' else m.getQuat()
+		except Exception:
+			return orig(*a, **k)
+	return get
+
+
+def _vr_restore():
+	sim = _State.vr
+	_State.vr = None
+	return sim.restore() if sim else []
+
+
+def cmd_vr_simulate(p):
+	"""Fake a headset: pose vizconnect trackers and hold input buttons, without hardware.
+	Overrides are made on the vizconnect objects themselves and undone by reset, quit or exit."""
+	if p.get('reset'):
+		errors = _vr_restore()
+		return {'reset': True, 'event_errors': errors}
+	vc = sys.modules.get('vizconnect')
+	if vc is None:
+		raise ValueError('vizconnect is not in use by this app (no vizconnect module is imported), '
+		                 'so there are no trackers or inputs to simulate')
+	trackers = {str(k): v for k, v in vc.getTrackerDict().items()}
+	inputs = {str(k): v for k, v in vc.getInputDict().items()}
+	sim = _State.vr or _VrSim()
+	if p.get('send_events') is not None:
+		sim.send_events = bool(p['send_events'])
+	if p.get('apply_to_node') is not None:
+		sim.apply_to_node = bool(p['apply_to_node'])
+
+	def as_list(v):
+		return [] if v is None else ([v] if isinstance(v, (str, int)) else list(v))
+
+	def split(item):
+		"""'right_hand:trigger' -> (input key, button); 'trigger' -> (default input, button)."""
+		name = p.get('input')
+		if isinstance(item, str) and ':' in item:
+			name, item = item.split(':', 1)
+		if name is None:
+			if len(inputs) != 1:
+				raise ValueError('which input? pass input=... or "name:button"; vizconnect has: %s'
+				                 % (', '.join(inputs) or 'none'))
+			name = next(iter(inputs))
+		return _vr_resolve(inputs, name, 'input'), item
+
+	bmap = {str(k).lower(): int(v) for k, v in (p.get('button_map') or {}).items()}
+
+	def tokens(button):
+		tok = _vr_token(button)
+		eq = set([tok])
+		if isinstance(tok, str) and tok in bmap:
+			eq.add(bmap[tok])
+		return tok, eq
+
+	# Validate everything before changing anything.
+	poses = {}
+	for who, pose in (p.get('poses') or {}).items():
+		key = _vr_resolve(trackers, who, 'tracker')
+		bad = set(pose) - set(('position', 'euler'))
+		if bad:
+			raise ValueError('pose for %s: unknown keys %s (use position and euler)' % (who, sorted(bad)))
+		poses[key] = {k: _vec(v) for k, v in pose.items()}
+	presses = [split(i) for i in as_list(p.get('press'))]
+	rel_items = as_list(p.get('release'))
+	release_all = 'all' in rel_items
+	releases = [] if release_all else [split(i) for i in rel_items]
+	frames = int(p.get('frames', 0))
+	if frames < 0:
+		raise ValueError('frames must be 0 or more')
+	_State.vr = sim
+
+	for key, pose in poses.items():
+		rec = sim.tracker(key, trackers[key])
+		rec.pose.update(pose)
+	if poses:
+		sim.start_hold()
+		sim.apply_nodes()
+
+	events, event_errors = [], []
+
+	def press(key, button):
+		rec = sim.input(key, inputs[key])
+		tok, eq = tokens(button)
+		rec.down[tok] = eq
+		events.append('down %s:%s' % (key, tok))
+		err = sim.event(rec, 'down', min([e for e in eq if isinstance(e, int)] or [tok]))
+		if err:
+			event_errors.append(err)
+
+	def let_go(key, button):
+		rec = sim.inputs.get(key)
+		tok, _ = tokens(button)
+		if rec is None or tok not in rec.down:
+			return
+		eq = rec.down.pop(tok)
+		events.append('up %s:%s' % (key, tok))
+		err = sim.event(rec, 'up', min([e for e in eq if isinstance(e, int)] or [tok]))
+		if err:
+			event_errors.append(err)
+
+	if release_all:
+		for key, rec in list(sim.inputs.items()):
+			for tok in list(rec.down):
+				let_go(key, tok)
+	for key, button in releases:
+		let_go(key, button)
+	try:
+		for key, button in presses:
+			press(key, button)
+		if presses and frames:
+			yield from _wait_frames(frames)
+	finally:
+		if presses and frames:
+			for key, button in presses:
+				let_go(key, button)
+	for key, rec in list(sim.inputs.items()):       # nothing held: give the device its own methods back
+		if not rec.down:
+			rec.restore()
+			del sim.inputs[key]
+	res = sim.status()
+	res.update({'events': events, 'event_errors': event_errors, 'notes': sim.notes, 'frames': frames})
+	if not (sim.trackers or sim.inputs):
+		_vr_restore()
+		res['active'] = False
+	else:
+		res['active'] = True
+	return res
+
+
+# ---------------------------------------------------------------------------
+# Validation of a recorded watch against theory
+# ---------------------------------------------------------------------------
+
+_MATH_FUNCS = {n: getattr(math, n) for n in (
+	'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh', 'exp', 'log',
+	'log10', 'log2', 'sqrt', 'pow', 'fabs', 'hypot', 'degrees', 'radians', 'floor', 'ceil', 'copysign')
+	if hasattr(math, n)}
+_MATH_FUNCS.update({'abs': abs, 'min': min, 'max': max})
+_MATH_CONSTS = {'pi': math.pi, 'e': math.e, 'tau': 2 * math.pi}
+_BIN_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+            ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+            ast.Pow: operator.pow}
+_UNARY_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+
+def _safe_compile(src, names):
+	"""Compile an arithmetic expression to f(values_dict) -> float.
+
+	Allowed: numbers, `names` (columns and constants), the math constants pi/e/tau,
+	+ - * / // % ** and unary +/-, and calls of math functions (sin, sqrt, atan2, ...,
+	abs, min, max). Everything else -- attributes, subscripts, strings, lambdas,
+	comprehensions, any other call -- is rejected before anything runs. Numbers are
+	floats, so an expression cannot build a huge integer."""
+	try:
+		tree = ast.parse(str(src).strip(), mode='eval')
+	except SyntaxError as e:
+		raise ValueError('cannot parse expression %r: %s' % (src, e))
+
+	def build(node):
+		if isinstance(node, ast.Expression):
+			return build(node.body)
+		if isinstance(node, ast.Constant):
+			v = node.value
+			if isinstance(v, bool) or not isinstance(v, (int, float)):
+				raise ValueError('only numbers are allowed in an expression, got %r' % (v,))
+			v = float(v)
+			return lambda env: v
+		if isinstance(node, ast.Name):
+			name = node.id
+			if name in names:
+				return lambda env: env[name]
+			if name in _MATH_CONSTS:
+				v = _MATH_CONSTS[name]
+				return lambda env: v
+			raise ValueError('unknown name %r; available: %s' % (
+				name, ', '.join(sorted(set(names) | set(_MATH_CONSTS) | set(_MATH_FUNCS)))))
+		if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+			op, a = _UNARY_OPS[type(node.op)], build(node.operand)
+			return lambda env: op(a(env))
+		if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+			op, a, b = _BIN_OPS[type(node.op)], build(node.left), build(node.right)
+
+			def binop(env):
+				r = op(a(env), b(env))
+				if isinstance(r, complex):
+					raise ValueError('result is not a real number')
+				return r
+			return binop
+		if isinstance(node, ast.Call):
+			if not isinstance(node.func, ast.Name) or node.func.id not in _MATH_FUNCS:
+				raise ValueError('only these functions may be called: %s' % ', '.join(sorted(_MATH_FUNCS)))
+			if node.keywords or any(isinstance(a, ast.Starred) for a in node.args):
+				raise ValueError('function calls take plain positional arguments')
+			fn, args = _MATH_FUNCS[node.func.id], [build(a) for a in node.args]
+			return lambda env: fn(*[a(env) for a in args])
+		raise ValueError('%s is not allowed in an expression' % type(node).__name__)
+
+	return build(tree)
+
+
+def _column_names(columns):
+	"""Identifier usable in an expression -> column index. 'pos.y' is available as pos_y."""
+	out = {}
+	for i, c in enumerate(columns):
+		for alias in (c, c.replace('.', '_')):
+			if alias.isidentifier() and alias not in out:
+				out[alias] = i
+	return out
+
+
+def cmd_validate(p):
+	"""Compare a watch column with a theoretical value computed from the other columns."""
+	name = p.get('watch')
+	if name not in _State.watches:
+		raise ValueError('no watch named %r (have: %s)' % (name, ', '.join(_State.watches) or 'none'))
+	w = _State.watches[name]
+	if not w.rows:
+		raise ValueError('watch %r has no samples yet' % name)
+	columns = ['t', 'frame'] + list(w.columns)
+	cols = _column_names(columns)
+	measured = p.get('measured')
+	if measured not in cols and measured not in columns:
+		raise ValueError('unknown measured column %r; have %s' % (measured, columns))
+	m_idx = columns.index(measured) if measured in columns else cols[measured]
+	consts = {}
+	for k, v in (p.get('constants') or {}).items():
+		if not str(k).isidentifier() or k in _MATH_FUNCS or k in _MATH_CONSTS or k in cols:
+			raise ValueError('constant name %r must be an identifier that is not a column, '
+			                 'a math function or pi/e/tau' % k)
+		consts[str(k)] = float(v)
+	theory = p.get('theory')
+	if not theory:
+		raise ValueError('theory is required: an expression over the columns, e.g. "P*L**3/(48*E*I)"')
+	fn = _safe_compile(theory, set(cols) | set(consts))
+	abs_tol, pct_tol = p.get('abs_tol'), p.get('pct_tol')
+	for label, v in (('abs_tol', abs_tol), ('pct_tol', pct_tol)):
+		if v is not None and float(v) < 0:
+			raise ValueError('%s must be 0 or more' % label)
+	t_min, t_max = p.get('t_min'), p.get('t_max')
+
+	picked, skipped, first_error = [], 0, None
+	for row in w.rows:
+		t = row[0]
+		if (t_min is not None and t < float(t_min)) or (t_max is not None and t > float(t_max)):
+			continue
+		env = dict(consts)
+		env.update((n, row[i]) for n, i in cols.items())
+		try:
+			th = float(fn(env))
+		except (ArithmeticError, ValueError) as e:
+			skipped += 1
+			first_error = first_error or '%s: %s' % (type(e).__name__, e)
+			continue
+		if th != th or th in (float('inf'), float('-inf')):
+			skipped += 1
+			continue
+		picked.append((t, row[m_idx], th))
+	if not picked:
+		raise ValueError('no usable samples (%d skipped%s, window t=%s..%s)' % (
+			skipped, ': ' + first_error if first_error else '', t_min, t_max))
+
+	n = len(picked)
+	errs = [m - th for _, m, th in picked]
+	abs_errs = [abs(e) for e in errs]
+	i_max = max(range(n), key=abs_errs.__getitem__)
+	pcts = [100.0 * abs(e) / abs(th) for e, (_, _, th) in zip(errs, picked) if th != 0]
+	peak = max(abs(th) for _, _, th in picked)
+	res = {
+		'watch': name, 'measured': measured, 'theory': theory, 'constants': consts,
+		'samples': n, 'skipped': skipped,
+		'max_abs_error': abs_errs[i_max], 't_of_max_error': picked[i_max][0],
+		'mean_abs_error': sum(abs_errs) / n, 'rms_error': math.sqrt(sum(e * e for e in errs) / n),
+		'bias': sum(errs) / n,
+		'max_pct_error': max(pcts) if pcts else None,
+		'mean_pct_error': sum(pcts) / len(pcts) if pcts else None,
+		'pct_undefined_samples': n - len(pcts),
+		'max_abs_error_pct_of_peak_theory': 100.0 * abs_errs[i_max] / peak if peak else None,
+	}
+	allowed = None
+	if abs_tol is not None or pct_tol is not None:
+		allowed = [max(float(abs_tol or 0.0), float(pct_tol or 0.0) / 100.0 * abs(th)) for _, _, th in picked]
+		ok = [a <= al for a, al in zip(abs_errs, allowed)]
+		n_pass = sum(ok)
+		need = float(p.get('min_pass_pct', 100.0))
+		res.update({'abs_tol': abs_tol, 'pct_tol': pct_tol, 'passing_samples': n_pass,
+		            'failing_samples': n - n_pass, 'pass_pct': 100.0 * n_pass / n,
+		            'min_pass_pct': need, 'passed': 100.0 * n_pass / n >= need,
+		            'tolerance_rule': 'a sample passes if |measured - theory| <= max(abs_tol, pct_tol% of |theory|)'})
+		bad = [i for i, o in enumerate(ok) if not o]
+		if bad:
+			t, m, th = picked[bad[0]]
+			res['first_failure'] = {'t': t, 'measured': m, 'theory': th, 'error': m - th}
+	rows = [[t, m, th, m - th] + ([int(ok[i])] if allowed else []) for i, (t, m, th) in enumerate(picked)]
+	head = ['t', 'measured', 'theory', 'error'] + (['pass'] if allowed else [])
+	path = p.get('csv_path') or os.path.join(_State.work_dir, 'validate_%s.csv' % name)
+	res['csv'] = _write_rows(path, 'csv', head, rows, {})
+	res['series'] = [r[:3] for r in _downsample(rows, int(p.get('max_points', 1500)))]
+	return res
+
+
+# ---------------------------------------------------------------------------
 # Command table
 # ---------------------------------------------------------------------------
 
@@ -1439,6 +2154,10 @@ COMMANDS = {
 	'scene_stats': cmd_scene_stats,
 	'profile': cmd_profile,
 	'vizconnect_info': cmd_vizconnect_info,
+	'gui_list': cmd_gui_list,
+	'click_button': cmd_click_button,
+	'vr_simulate': cmd_vr_simulate,
+	'validate': cmd_validate,
 	'quit': cmd_quit,
 }
 
@@ -1638,6 +2357,7 @@ def start(port=None, host='127.0.0.1', token=None, quiet=False):
 
 def stop():
 	global _server, _pump_event
+	_vr_restore()
 	if _server is not None:
 		_server.stop()
 		_server = None

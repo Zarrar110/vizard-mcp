@@ -41,7 +41,12 @@ Measuring: watch_start / watch_read / watch_plot record any expressions every fr
 watch_export writes them to CSV or JSON for reports;
 wait_until runs the app until a condition holds; profile finds slow Python per frame;
 scene_stats counts nodes, textures, triangles and lights to explain a slow scene.
+validate compares a recorded watch with a formula (beam deflection, free fall, ...) and
+reports error statistics, pass/fail and a measured-vs-theory chart.
 Regression checks: screenshot_diff compares the window with a reference PNG.
+GUI: gui_list lists the app's 2D widgets (buttons, sliders, ...) with text and window
+position; click_button clicks one by its label. vr_simulate fakes a headset's tracker poses
+and button presses through vizconnect, to test VR menus on a desktop.
 Screen coordinates are 0..1 from the top-left corner of the screenshot.
 
 Vizard is Y-up and left-handed; euler is [yaw, pitch, roll] in degrees.
@@ -502,6 +507,64 @@ def click(x: float, y: float, button: str = 'left', double: bool = False) -> str
 
 
 @mcp.tool()
+def gui_list(visible_only: bool = False, kinds: list[str] | None = None) -> str:
+	"""List the app's 2D GUI widgets (buttons, labels, checkboxes, sliders, textboxes, ...):
+	id, script names, class, kind, text/label, visible, enabled, and center/size as 0..1
+	fractions of the window from the top-left (the same coordinates as a screenshot and click).
+	Widgets parented into the 3D scene (e.g. a vizconnect wrist or tablet panel) are listed
+	separately under world_widgets with their world position; they cannot be clicked.
+	visible_only: leave out hidden widgets. kinds: only these kinds, e.g. ["button"]."""
+	return _dump(_call('gui_list', visible_only=visible_only or None, kinds=kinds))
+
+
+@mcp.tool()
+def click_button(label: str | None = None, id: int | None = None, button: str = 'left',
+                 double: bool = False) -> str:
+	"""Click a 2D GUI widget by its text instead of by coordinates (see gui_list). The label
+	is matched against visible, enabled widgets: exact text first, then ignoring case, then as
+	a case-insensitive part of the text ("reset" finds "Reset ball"). If nothing matches, or
+	several widgets do, it fails and lists the candidates; pass `id` from gui_list to choose
+	one. The click itself is the real-mouse click of the click tool, with the same caveats."""
+	if label is None and id is None:
+		raise VizardToolError('Give label or id.')
+	return _dump(_call('click_button', wait_s=40, label=label, id=id, button=button, double=double))
+
+
+@mcp.tool()
+def vr_simulate(poses: dict[str, dict[str, list[float]]] | None = None, press: list[str] | None = None,
+                release: list[str] | None = None, frames: int = 0, input: str | None = None,
+                button_map: dict[str, int] | None = None, send_events: bool = True,
+                apply_to_node: bool = True, reset: bool = False) -> str:
+	"""Test a vizconnect VR app on a desktop, with no headset. Needs an app that uses vizconnect.
+
+	poses: tracker poses held until reset, e.g. {"head": {"position": [0, 1.7, 0], "euler":
+	       [30, 0, 0]}, "right_hand": {"position": [0.3, 1.2, 0.4]}}. Keys are vizconnect tracker
+	       names, or the aliases head / left_hand / right_hand; a part left out keeps its value.
+	press / release: input buttons by name or index, e.g. ["trigger", "grip", "menu"]; write
+	       "right_hand:trigger" to pick the input device (needed when the app has several, or
+	       set `input`). release=["all"] lets go of everything.
+	frames: with press, hold the buttons for this many frames and then release them. 0 keeps
+	       them down until a later release.
+	button_map: names to button indexes, e.g. {"trigger": 0, "grip": 1} (the mapping depends on
+	       the device in the vizconnect config).
+	send_events: also send viz.SENSOR_DOWN_EVENT / SENSOR_UP_EVENT for presses and releases.
+	apply_to_node: also move each tracker's node every frame.
+	reset: undo everything. The originals are also restored when the app quits.
+	With no arguments it reports what is currently simulated. Parts of this that were only
+	checked offline are listed in the README."""
+	if frames < 0:
+		raise VizardToolError('frames must be 0 or more.')
+	for who, pose in (poses or {}).items():
+		if not isinstance(pose, dict) or not set(pose) <= {'position', 'euler'}:
+			raise VizardToolError('poses[%r] must be {"position": [x, y, z], "euler": [yaw, pitch, roll]}.' % who)
+		if any(len(v) != 3 for v in pose.values()):
+			raise VizardToolError('poses[%r]: position and euler need 3 numbers each.' % who)
+	return _dump(_call('vr_simulate', wait_s=frames / 5.0 + 30, poses=poses, press=press, release=release,
+	                   frames=frames, input=input, button_map=button_map, send_events=send_events,
+	                   apply_to_node=apply_to_node, reset=reset or None))
+
+
+@mcp.tool()
 def wait(frames: int = 0, seconds: float = 0.0) -> str:
 	"""Let the app run until at least `frames` frames and `seconds` seconds have passed."""
 	return _dump(_call('wait', wait_s=seconds + frames / 5.0 + 30, frames=frames, seconds=seconds))
@@ -574,6 +637,44 @@ def watch_export(name: str, path: str, format: str | None = None,
 		raise VizardToolError('format must be "csv" or "json".')
 	return _dump(_call('watch_export', name=name, path=os.path.abspath(path),
 	                   format=format.lower() if format else None, columns=columns))
+
+
+@mcp.tool(structured_output=False)
+def validate(watch: str, measured: str, theory: str, constants: dict[str, float] | None = None,
+             abs_tol: float | None = None, pct_tol: float | None = None, t_min: float | None = None,
+             t_max: float | None = None, min_pass_pct: float = 100.0, title: str | None = None,
+             csv_path: str | None = None) -> list[Any]:
+	"""Compare a recorded watch with theory. For every sample the theory expression is
+	evaluated and compared with the measured column; returns max / mean / RMS error, % error,
+	how many samples are within tolerance, and a chart of measured vs theory.
+
+	watch: name of the watch. measured: the column to check, e.g. "midspan_mm".
+	theory: an arithmetic expression over the watch's columns (t, frame and the watched
+	        labels; "pos.y" is written pos_y) and `constants`, e.g. "P*L**3/(48*E*I)" or
+	        "0.5*9.81*t**2", or just a reference column name. Allowed: numbers, + - * / // % **,
+	        pi e tau, and sin cos tan asin acos atan atan2 sinh cosh tanh exp log log10 log2 sqrt
+	        pow fabs hypot degrees radians floor ceil copysign abs min max. Nothing else runs.
+	constants: named numbers used in the expression, {"P": 1000, "L": 2.0}.
+	abs_tol / pct_tol: a sample passes if |measured - theory| <= max(abs_tol, pct_tol % of
+	        |theory|); give one or both. Without either there are statistics but no verdict.
+	t_min / t_max: only samples in this window of app time (seconds).
+	min_pass_pct: overall pass needs at least this % of samples within tolerance (default all).
+	csv_path: where to write the per-sample comparison (default: the vizmcp temp folder)."""
+	if not measured or not theory:
+		raise VizardToolError('measured and theory are required.')
+	for label, v in (('abs_tol', abs_tol), ('pct_tol', pct_tol)):
+		if v is not None and v < 0:
+			raise VizardToolError('%s must be 0 or more.' % label)
+	if not 0 <= min_pass_pct <= 100:
+		raise VizardToolError('min_pass_pct must be 0..100.')
+	res = _call('validate', watch=watch, measured=measured, theory=theory, constants=constants,
+	            abs_tol=abs_tol, pct_tol=pct_tol, t_min=t_min, t_max=t_max, min_pass_pct=min_pass_pct,
+	            csv_path=os.path.abspath(csv_path) if csv_path else None, max_points=1500)
+	series = res.pop('series')
+	t = [r[0] for r in series]
+	im = imaging.line_chart(title or 'watch "%s": %s vs theory' % (watch, measured), t,
+	                        [('measured', [r[1] for r in series]), ('theory', [r[2] for r in series])])
+	return [_jpeg(im), _dump(res)]
 
 
 @mcp.tool()

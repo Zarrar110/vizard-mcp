@@ -16,7 +16,7 @@ EXPECTED = {
 	'set_node', 'run_code', 'get_log', 'vizconnect_info', 'vizard_api', 'screenshot', 'multi_view',
 	'filmstrip', 'record_video', 'pick', 'project', 'camera', 'send_key', 'click', 'wait', 'wait_until',
 	'watch_start', 'watch_read', 'watch_plot', 'profile', 'call_command', 'watch_export',
-	'screenshot_diff', 'scene_stats'}
+	'screenshot_diff', 'scene_stats', 'gui_list', 'click_button', 'vr_simulate', 'validate'}
 
 
 def run(coro):
@@ -29,9 +29,9 @@ def no_app(monkeypatch):
 	monkeypatch.setitem(S._launched, 'proc', None)
 
 
-def test_all_31_tools_register_with_valid_schemas():
+def test_all_35_tools_register_with_valid_schemas():
 	tools = run(S.mcp.list_tools())
-	assert len(tools) == 31
+	assert len(tools) == 35
 	assert {t.name for t in tools} == EXPECTED
 	for t in tools:
 		assert t.description, t.name

@@ -125,6 +125,23 @@ try:
 	save(plot[0], 'watch_plot.jpg')
 	check('watch_plot', len(plot[0].data) > 5000)
 
+	# validate: energy is conserved in free fall, so h = h0 - v^2 / 2g whatever moment the
+	# watch started at. Only samples before the first impact are used.
+	val = S.validate('bounce', 'h', 'h0 - v**2/(2*g)', constants={'h0': 2.0, 'g': 9.81}, abs_tol=0.02, t_max=0.5,
+	                 csv_path=os.path.join(OUT, 'validate_bounce.csv'))
+	save(val[0], 'validate_chart.jpg')
+	vj = j(val[1])
+	check('validate: free-fall energy matches theory', vj['passed'] is True and vj['samples'] > 10
+	      and vj['max_abs_error'] < 0.02 and os.path.getsize(vj['csv']) > 100,
+	      {k: vj.get(k) for k in ('samples', 'max_abs_error', 'rms_error', 'mean_pct_error', 'pass_pct')})
+	bad = j(S.validate('bounce', 'h', '2.5 - v**2/(2*g)', constants={'g': 9.81}, abs_tol=0.02, t_max=0.5)[1])
+	check('validate: a wrong theory fails', bad['passed'] is False and bad['failing_samples'] == bad['samples'], bad['max_abs_error'])
+	try:
+		S.validate('bounce', 'h', "__import__('os').getcwd()")
+		check('validate rejects unsafe expressions', False)
+	except RuntimeError as e:
+		check('validate rejects unsafe expressions', 'only these functions' in str(e) or 'not allowed' in str(e), e)
+
 	# --- seeing ------------------------------------------------------------
 	shot = S.screenshot(max_size=800, annotate=True, save_to=os.path.join(OUT, 'demo.png'))
 	save(shot[0], 'demo_annotated.jpg')
@@ -190,6 +207,55 @@ try:
 		check('click rejects x outside 0..1', False)
 	except RuntimeError as e:
 		check('click rejects x outside 0..1', '0..1' in str(e), e)
+
+	# --- 2D GUI: gui_list / click_button ------------------------------------
+	gl = j(S.gui_list())
+	btns = [w for w in gl['widgets'] if w['kind'] == 'button']
+	info('gui_list', [(w['id'], w['type'], w['kind'], w['text'], w['center'], w['visible'], w['enabled']) for w in gl['widgets']])
+	check('gui_list finds the Reset button', any(w['text'] == 'Reset ball' for w in btns), [w['text'] for w in gl['widgets']])
+	if btns:
+		rb = [w for w in btns if w['text'] == 'Reset ball'][0]
+		center, why = button_center()
+		check('gui_list center matches the button bounding box (top-left origin)',
+		      center is not None and abs(rb['center'][0] - center[0]) < 2e-3 and abs(rb['center'][1] - center[1]) < 2e-3,
+		      (rb['center'], center, why))
+		check('gui_list: no world widgets in the demo', gl['world_widgets'] == [], gl['world_widgets'])
+		drops = int(j(S.run_code('drop.drops'))['value'])
+		try:
+			ck = j(S.click_button(label='reset BALL'))
+			S.wait(frames=5)
+			drops2 = int(j(S.run_code('drop.drops'))['value'])
+			check('click_button by case-insensitive text', drops2 == drops + 1 and ck['widget']['id'] == rb['id'], (drops, drops2, ck['click']))
+			ck = j(S.click_button(id=rb['id']))
+			S.wait(frames=5)
+			check('click_button by id', int(j(S.run_code('drop.drops'))['value']) == drops + 2)
+		except RuntimeError as e:
+			check('click_button', False, e)
+	try:
+		S.click_button(label='no such button')
+		check('click_button not found lists candidates', False)
+	except RuntimeError as e:
+		check('click_button not found lists candidates', 'Reset ball' in str(e), e)
+	S.run_code("extra = viz.addButtonLabel('Reset camera'); extra.setPosition(0.4, 0.92)")
+	try:
+		S.click_button(label='reset')
+		check('click_button ambiguous lists candidates', False)
+	except RuntimeError as e:
+		check('click_button ambiguous lists candidates', 'ambiguous' in str(e) and 'Reset camera' in str(e), e)
+	S.run_code('extra.remove()')
+
+	# --- vr_simulate: the demo has no vizconnect, so only the error path runs ------
+	if j(S.vizconnect_info()).get('loaded'):
+		vs = j(S.vr_simulate(poses={'head': {'position': [0, 1.7, 0]}}))
+		check('vr_simulate poses head', vs['active'], vs)
+		S.vr_simulate(reset=True)
+	else:
+		info('vr_simulate live check skipped', 'the demo scene does not use vizconnect; run it against a vizconnect app')
+		try:
+			S.vr_simulate(poses={'head': {'position': [0, 1.7, 0]}})
+			check('vr_simulate without vizconnect is a clear error', False)
+		except RuntimeError as e:
+			check('vr_simulate without vizconnect is a clear error', 'vizconnect is not in use' in str(e), e)
 
 	# --- reporting and regression tools --------------------------------------
 	exp_csv = os.path.join(OUT, 'bounce_export.csv')
