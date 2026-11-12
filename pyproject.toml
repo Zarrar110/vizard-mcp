@@ -30,7 +30,6 @@ classifiers = [
 dependencies = ["mcp>=2.3,<3", "pillow>=10"]
 
 [project.optional-dependencies]
-video = ["imageio-ffmpeg>=0.5"]
 test = ["pytest>=8"]
 
 [project.urls]

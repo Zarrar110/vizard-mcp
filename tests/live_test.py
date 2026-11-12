@@ -1,24 +1,21 @@
 """End-to-end test against real Vizard: launches examples/demo_scene.py through
-the MCP tool functions, exercises every tool, checks the physics the demo
-simulates, and quits the app.
+the MCP tool functions, exercises the tools, checks the scene the demo
+builds, and quits the app.
 
     python tests/live_test.py
 
 Needs a real Vizard install. Under pytest it is skipped unless VIZMCP_LIVE=1.
 """
 
-import csv
 import json
 import os
-import re
-import subprocess
 import sys
 
 if __name__ != '__main__' and os.environ.get('VIZMCP_LIVE') != '1':
 	import pytest
 	pytest.skip('needs a real Vizard install; set VIZMCP_LIVE=1 to run', allow_module_level=True)
 
-from vizard_mcp import server as S, video
+from vizard_mcp import server as S
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = os.path.join(HERE, '..', 'examples', 'demo_scene.py')
@@ -50,38 +47,6 @@ def button_center():
 	return json.loads(rc['value'].replace("'", '"')), None
 
 
-def plays_as_h264(path):
-	"""Does the file exist, have a size, and does ffprobe / ffmpeg -i report an h264 video stream?
-	Returns (ok, detail). Uses the same ffmpeg the server converts with."""
-	if not os.path.isfile(path) or os.path.getsize(path) == 0:
-		return False, 'missing or empty: %s' % path
-	found = video.find_ffmpeg()
-	if found is None:
-		return False, 'no ffmpeg to inspect the file with'
-	ffmpeg = found[0]
-	ffprobe = os.path.join(os.path.dirname(ffmpeg), 'ffprobe' + os.path.splitext(ffmpeg)[1])
-	if os.path.basename(ffmpeg).lower().startswith('ffmpeg') and os.path.isfile(ffprobe):
-		cmd = [ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
-		       'stream=codec_name,pix_fmt,width,height', '-of', 'csv=p=0', path]
-		out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode()
-	else:       # e.g. imageio-ffmpeg's renamed binary has no ffprobe next to it: `ffmpeg -i` prints the streams
-		out = subprocess.run([ffmpeg, '-hide_banner', '-i', path], stdout=subprocess.PIPE,
-		                     stderr=subprocess.STDOUT).stdout.decode()
-	return 'h264' in out, '%d bytes; %s' % (os.path.getsize(path), ' '.join(out.split())[:200])
-
-
-def video_frames(path):
-	"""How many video frames the file has, counted by decoding it with the server's ffmpeg
-	(`ffmpeg -i f -f null -` prints frame=N); None if that cannot be done."""
-	found = video.find_ffmpeg()
-	if found is None or not os.path.isfile(path):
-		return None
-	out = subprocess.run([found[0], '-hide_banner', '-nostdin', '-i', path, '-map', '0:v:0', '-f', 'null', '-'],
-	                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode(errors='replace')
-	counts = re.findall(r'frame=\s*(\d+)', out)
-	return int(counts[-1]) if counts else None
-
-
 def save(img, name):
 	with open(os.path.join(OUT, name), 'wb') as f:
 		f.write(img.data)
@@ -101,7 +66,7 @@ check('launch', launched.get('frame', 0) > 0, 'startup %ss, vizard %s, vizmcp %s
 try:
 	# --- inspection --------------------------------------------------------
 	st = j(S.vizard_status())
-	check('status', st['connected'] and st['script'].endswith('demo_scene.py') and 'watch_start' in st['commands'])
+	check('status', st['connected'] and st['script'].endswith('demo_scene.py') and 'scene_tree' in st['commands'])
 
 	tree = j(S.scene_tree(depth=2, only_named=True))
 	names = sorted(n for node in tree['nodes'] for n in node['names'])
@@ -136,108 +101,10 @@ try:
 	except RuntimeError as e:
 		check('bad node raises', 'NameError' in str(e))
 
-	# --- physics through a watch -------------------------------------------
-	S.run_code('drop.reset()')
-	w = j(S.watch_start({'h': 'drop.height', 'v': 'drop.velocity', 'pos': 'ball.getPosition()'},
-	                    name='bounce', until='drop.bounces >= 2'))
-	check('watch_start columns', w['columns'] == ['h', 'v', 'pos.x', 'pos.y', 'pos.z'], w['columns'])
-	u = j(S.wait_until('drop.bounces >= 2', limit_s=10))
-	check('wait_until', u['met'], u)
-	S.wait(frames=3)
-	r = j(S.watch_read('bounce', max_points=0))
-	check('watch stopped by until', 'until condition met' in (r['status']['stop_reason'] or ''), r['status'])
-	with open(r['csv']) as f:
-		rows = [list(map(float, row)) for row in list(csv.reader(f))[1:]]
-	# columns: t, frame, h, v, pos.x, pos.y, pos.z
-	v = [row[3] for row in rows]
-	first_bounce = next(i for i in range(1, len(v)) if v[i - 1] < 0 <= v[i])
-	peak = max(row[2] for row in rows[first_bounce:])
-	check('physics: bounce peak = e^2 h0 = 1.28 m', abs(peak - 1.28) < 0.02, 'measured %.4f m' % peak)
-	t_impact = rows[first_bounce][0]
-	check('physics: first impact at sqrt(2h/g) = 0.639 s', abs(t_impact - 0.6386) < 0.04, 'measured %.3f s' % t_impact)
-	plot = S.watch_plot('bounce', columns=['h'], title='Ball height (m), e = 0.8')
-	save(plot[0], 'watch_plot.jpg')
-	check('watch_plot', len(plot[0].data) > 5000)
-
-	# validate: energy is conserved in free fall, so h = h0 - v^2 / 2g whatever moment the
-	# watch started at. Only samples before the first impact are used.
-	val = S.validate('bounce', 'h', 'h0 - v**2/(2*g)', constants={'h0': 2.0, 'g': 9.81}, abs_tol=0.02, t_max=0.5,
-	                 csv_path=os.path.join(OUT, 'validate_bounce.csv'))
-	save(val[0], 'validate_chart.jpg')
-	vj = j(val[1])
-	check('validate: free-fall energy matches theory', vj['passed'] is True and vj['samples'] > 10
-	      and vj['max_abs_error'] < 0.02 and os.path.getsize(vj['csv']) > 100,
-	      {k: vj.get(k) for k in ('samples', 'max_abs_error', 'rms_error', 'mean_pct_error', 'pass_pct')})
-	bad = j(S.validate('bounce', 'h', '2.5 - v**2/(2*g)', constants={'g': 9.81}, abs_tol=0.02, t_max=0.5)[1])
-	check('validate: a wrong theory fails', bad['passed'] is False and bad['failing_samples'] == bad['samples'], bad['max_abs_error'])
-	try:
-		S.validate('bounce', 'h', "__import__('os').getcwd()")
-		check('validate rejects unsafe expressions', False)
-	except RuntimeError as e:
-		check('validate rejects unsafe expressions', 'only these functions' in str(e) or 'not allowed' in str(e), e)
-
-	# --- snapshots: move things, then put them back --------------------------
-	def label_state():
-		n = j(S.node_info('label'))
-		return n['pos'], n['visible']
-	pos0, vis0 = label_state()
-	S.run_code('tmp_box = vizshape.addBox(size=[0.1, 0.1, 0.1])')
-	snap_file = os.path.join(OUT, 'live_snapshot.json')
-	sv = j(S.snapshot_save('live', nodes=['label', 'beam', 'tmp_box'], state='table.rate_deg_s',
-	                       restore_code='table.rate_deg_s = _state', path=snap_file))
-	check('snapshot_save', sv['nodes'] == 3 and os.path.isfile(snap_file) and [r['name'] for r in j(S.snapshot_list())['snapshots']] == ['live'], sv)
-	check('snapshot_list reads the file without the app', j(S.snapshot_list(path=snap_file))['nodes'] == 3)
-	S.set_node('label', position=[3, 5, 1], visible=False)
-	S.run_code('table.rate_deg_s = 90.0')
-	S.run_code('tmp_box.remove()\ndel tmp_box')
-	S.wait(frames=3)
-	moved_pos, moved_vis = label_state()
-	check('snapshot: the node really was moved first', abs(moved_pos[0] - 3) < 1e-3 and moved_vis is False, (moved_pos, moved_vis))
-	rs = j(S.snapshot_restore('live'))
-	pos1, vis1 = label_state()
-	check('snapshot_restore: position, visibility and state are back',
-	      all(abs(a - b) < 1e-4 for a, b in zip(pos0, pos1)) and vis1 == vis0 == True
-	      and j(S.run_code('table.rate_deg_s'))['value'] == '30.0' and rs['state'] == {'restored': True}, (pos0, pos1, rs.get('state')))
-	check('snapshot_restore reports the node that was deleted',
-	      rs['restored'] == 2 and [m['ref'] for m in rs['missing']] == ['tmp_box'] and not rs['failed'], rs)
-	S.set_node('label', position=[-4, 1, 1])
-	S.run_code('table.rate_deg_s = 45.0')
-	rf = j(S.snapshot_restore(path=snap_file))
-	check('snapshot_restore from the JSON file', rf['restored'] == 2 and label_state()[0] == pos0
-	      and j(S.run_code('table.rate_deg_s'))['value'] == '30.0', rf)
-
-	# --- report: a watch, a validate and a screenshot in one HTML file ---------
-	rep_path = os.path.join(OUT, 'live_report.html')
-	rep = j(S.make_report([
-		{'type': 'heading', 'text': 'Bouncing ball'},
-		{'type': 'text', 'text': 'Dropped from **2 m**, e = 0.8.'},
-		{'type': 'watch', 'name': 'bounce', 'columns': ['h']},
-		{'type': 'validate', 'watch': 'bounce', 'measured': 'h', 'theory': 'h0 - v**2/(2*g)',
-		 'constants': {'h0': 2.0, 'g': 9.81}, 'abs_tol': 0.02, 't_max': 0.5},
-		{'type': 'screenshot', 'caption': 'The scene'},
-		{'type': 'keyvalue', 'items': {'Restitution': 0.8}}], path=rep_path, title='Live check report'))
-	with open(rep_path, encoding='utf-8') as f:
-		page = f.read()
-	check('make_report: file with 3 inline images, a PASS badge and the header',
-	      rep['images'] == 3 and page.count('data:image/') == 3 and 'badge pass">PASS' in page
-	      and 'Zarrar Abbas' in page and 'demo_scene.py' in page and os.path.getsize(rep_path) > 20000,
-	      (rep['images'], rep['bytes'], rep['all_validations_passed']))
-	check('make_report: validations summarised', rep['all_validations_passed'] is True, rep['validations'])
-
 	# --- seeing ------------------------------------------------------------
 	shot = S.screenshot(max_size=800, annotate=True, save_to=os.path.join(OUT, 'demo.png'))
 	save(shot[0], 'demo_annotated.jpg')
 	check('screenshot annotate', 'labelled' in shot[1] and os.path.getsize(os.path.join(OUT, 'demo.png')) > 1000, shot[1])
-
-	cam_before = j(S.camera())
-	mv = S.multi_view(orbit='turntable', count=4)
-	save(mv[0], 'multi_view.jpg')
-	cam_after = j(S.camera())
-	check('multi_view restores camera', cam_before == cam_after, (cam_before, cam_after))
-
-	fs = S.filmstrip(count=4, interval_s=0.3)
-	save(fs[0], 'filmstrip.jpg')
-	check('filmstrip', 'frames' in fs[1], fs[1])
 
 	pr = j(S.project(points=[[0, 0, -20]], nodes=['beam', 'ball']))
 	scr = [it['screen'] for it in pr['items']]
@@ -246,49 +113,6 @@ try:
 	check('pick finds the beam at its projected center', pk['hit'] and 'beam' in pk.get('node', {}).get('names', []), pk)
 	pk = j(S.pick(x=0.5, y=0.02))
 	check('pick sky = no hit', not pk['hit'], pk)
-
-	vid = j(S.record_video(seconds=2, path=os.path.join(OUT, 'demo.avi'), format='avi'))
-	check('record_video avi', vid['bytes'] > 10000 and vid['format'] == 'avi', vid)
-	os.remove(vid['path'])      # uncompressed AVI, tens of MB
-
-	vid = j(S.record_video(seconds=2, path=os.path.join(OUT, 'demo.mp4')))
-	ok, detail = plays_as_h264(vid['path'])
-	check('record_video mp4 plays (h264)', vid.get('mp4_converted') and vid['format'] == 'mp4' and ok
-	      and not os.path.exists(os.path.splitext(vid['path'])[0] + '.avi'), (vid.get('mp4_error') or detail))
-	info('record_video mp4', {k: vid.get(k) for k in ('bytes', 'avi_bytes', 'frames', 'seconds', 'ffmpeg_source')})
-
-	cam_before = j(S.camera())
-	preview = S.record_tour(orbit='turntable', duration=4, dry_run=True, count=4)
-	save(preview[0], 'tour_preview.jpg')
-	check('record_tour dry_run filmstrip', 'dry run' in preview[1] and j(S.camera()) == cam_before, preview[1].splitlines()[0])
-	tour = j(S.record_tour(orbit='turntable', duration=3, degrees=180, path=os.path.join(OUT, 'orbit_tour.mp4')))
-	ok, detail = plays_as_h264(tour['path'])
-	check('record_tour orbit mp4 plays (h264)', tour.get('mp4_converted') and ok, tour.get('mp4_error') or detail)
-	check('record_tour restores the camera', j(S.camera()) == cam_before, (cam_before, j(S.camera())))
-	check('record_tour released the hold', not j(S.vizard_status()).get('camera_held'))
-	bb = j(S.node_info('turntable'))['bbox']
-	cx, cy, cz = bb['center']
-	r = max(bb['size']) * 2.5
-	kf = [{'position': [cx + r, cy + r / 2, cz + r], 'look_at': [cx, cy, cz], 't': 0},
-	      {'position': [cx, cy + r, cz + r * 1.2], 'look_at': [cx, cy, cz], 't': 1.5},
-	      {'position': [cx - r, cy + r / 2, cz + r], 'look_at': [cx, cy, cz], 't': 3}]
-	fly = j(S.record_tour(keyframes=kf, path=os.path.join(OUT, 'fly_tour.mp4'), max_size=640))
-	ok, detail = plays_as_h264(fly['path'])
-	check('record_tour keyframes mp4 plays (h264)', fly.get('mp4_converted') and ok and fly['duration'] == 3, fly.get('mp4_error') or detail)
-	check('record_tour restores the camera (keyframes)', j(S.camera()) == cam_before)
-
-	# mode "steps": every output frame is a captured PNG, so the video has exactly fps x duration frames
-	# however slowly the scene renders. The camera must come back, and the PNGs must be gone.
-	st = j(S.record_tour(orbit='turntable', duration=2, degrees=180, mode='steps', fps=30,
-	                     path=os.path.join(OUT, 'steps_tour.mp4')))
-	ok, detail = plays_as_h264(st['path'])
-	check('record_tour steps mp4 plays (h264)', st.get('mp4_converted') and ok, st.get('mp4_error') or detail)
-	n_video = video_frames(st['path'])
-	check('record_tour steps: the MP4 has fps x 2 = 60 frames', st['frames'] == 60 and n_video == 60, (st['frames'], n_video))
-	check('record_tour steps: PNGs deleted, camera restored',
-	      st.get('frames_deleted') is True and j(S.camera()) == cam_before and not j(S.vizard_status()).get('camera_held'),
-	      (st.get('frames_deleted'), cam_before, j(S.camera())))
-	info('record_tour steps', {k: st.get(k) for k in ('frames', 'wall_s', 'wall_s_per_frame', 'bytes', 'window_size')})
 
 	# --- driving -----------------------------------------------------------
 	j(S.send_key(' ', hold_frames=3))
@@ -365,59 +189,6 @@ try:
 		check('click_button ambiguous lists candidates', 'ambiguous' in str(e) and 'Reset camera' in str(e), e)
 	S.run_code('extra.remove()')
 
-	# --- vr_simulate: the demo has no vizconnect, so only the error path runs ------
-	if j(S.vizconnect_info()).get('loaded'):
-		vs = j(S.vr_simulate(poses={'head': {'position': [0, 1.7, 0]}}))
-		check('vr_simulate poses head', vs['active'], vs)
-		S.vr_simulate(reset=True)
-	else:
-		info('vr_simulate live check skipped', 'the demo scene does not use vizconnect; run it against a vizconnect app')
-		try:
-			S.vr_simulate(poses={'head': {'position': [0, 1.7, 0]}})
-			check('vr_simulate without vizconnect is a clear error', False)
-		except RuntimeError as e:
-			check('vr_simulate without vizconnect is a clear error', 'vizconnect is not in use' in str(e), e)
-
-	# --- reporting and regression tools --------------------------------------
-	exp_csv = os.path.join(OUT, 'bounce_export.csv')
-	ex = j(S.watch_export('bounce', exp_csv))
-	check('watch_export csv', ex['format'] == 'csv' and ex['rows'] == len(rows) and os.path.getsize(exp_csv) > 100, ex)
-	with open(exp_csv) as f:
-		exp_rows = list(csv.reader(f))
-	check('watch_export csv matches the recorded data',
-	      exp_rows[0] == ['t', 'frame', 'h', 'v', 'pos.x', 'pos.y', 'pos.z']
-	      and [float(c) for c in exp_rows[1]] == rows[0] and len(exp_rows) == len(rows) + 1, exp_rows[:2])
-	exp_json = os.path.join(OUT, 'bounce_export.json')
-	ex = j(S.watch_export('bounce', exp_json, columns=['t', 'h']))
-	with open(exp_json) as f:
-		doc = json.load(f)
-	check('watch_export json + column subset', doc['columns'] == ['t', 'h'] and len(doc['rows']) == len(rows)
-	      and doc['rows'][0] == [rows[0][0], rows[0][2]] and doc['expressions']['h'] == 'drop.height', doc['columns'])
-	try:
-		S.watch_export('bounce', exp_csv, columns=['nope'])
-		check('watch_export unknown column raises', False)
-	except RuntimeError as e:
-		check('watch_export unknown column raises', 'unknown columns' in str(e), e)
-
-	# screenshot_diff: freeze the scene so two captures should match, then change it.
-	S.run_code('table.running = False\ndrop.update = lambda dt: None')
-	S.wait(frames=10)
-	ref_png = os.path.join(OUT, 'diff_reference.png')
-	S.screenshot_diff(ref_png, update_reference=True)
-	check('screenshot_diff writes the reference', os.path.getsize(ref_png) > 1000)
-	same = S.screenshot_diff(ref_png, threshold_pct=0.5, save_diff_to=os.path.join(OUT, 'diff_same.png'))
-	same_j = j(same[1])
-	check('screenshot_diff: unchanged scene passes', same_j['passed'], same_j)
-	S.set_node('beam', visible=False)
-	S.wait(frames=5)
-	changed = S.screenshot_diff(ref_png, threshold_pct=0.5, save_diff_to=os.path.join(OUT, 'diff_changed.png'))
-	save(changed[0], 'diff_changed.jpg')
-	ch_j = j(changed[1])
-	check('screenshot_diff: hidden beam fails and is boxed',
-	      ch_j['passed'] is False and ch_j['diff_pct'] > 0.5 and ch_j['bbox'] is not None, ch_j)
-	S.set_node('beam', visible=True)
-	S.run_code('del drop.update\ntable.running = True')
-
 	n_total = int(j(S.run_code('len(viz.getNodeList())'))['value'])
 	st1 = j(S.scene_stats(top=5))
 	check('scene_stats node count matches Vizard', st1['nodes'] == n_total and 0 < st1['visible_nodes'] <= n_total, st1['nodes'])
@@ -435,43 +206,10 @@ try:
 	for q in ('triangle', 'getTexture', 'light'):
 		info('vizard_api %r' % q, S.vizard_api(q, limit=8).replace('\n', ' | '))
 
-	# asset_check: the totals are the scene's own getStats, and the per-node tables are filled in.
-	ac = j(S.asset_check(top=5, html=True))
-	sc = j(S.run_code('s = viz.MainScene.getStats()\n[s.primitiveCount, s.vertexCount, s.drawableCount, '
-	                  's.textureCount, s.textureBytes]'))
-	want = json.loads(sc['value'].replace("'", '"')) if 'value' in sc else None
-	t = ac['totals']
-	check('asset_check totals equal viz.MainScene.getStats()', want == [t['primitives'], t['vertices'], t['drawables'],
-	      t['textures'], t['texture_bytes']] and t['primitives'] > 0, (want, t))
-	check('asset_check ranks the heaviest nodes with names', 0 < len(ac['top_nodes']) <= 5
-	      and all(r['own_primitives'] >= 0 and 'size' in r for r in ac['top_nodes']), ac['top_nodes'][:2])
-	check('asset_check returns an HTML section', '<table' in ac['html_section'] and 'Scene totals' in ac['html_section'])
-	info('asset_check findings', ac['findings'])
-	info('asset_check notes', ac['notes'])
-	info('asset_check file probing', {'checked': ac['files']['checked'], 'missing': len(ac['files']['missing'])})
-
-	# crawl_gui: the demo's Reset ball button changes the picture and logs; the ball is put back after.
-	cg = j(S.crawl_gui(label='^Reset ball$', nodes=['ball'], settle_frames=10, save_dir=os.path.join(OUT, 'crawl')))
-	row = cg['results'][0] if cg['results'] else {}
-	check('crawl_gui clicked the Reset ball button', cg['summary']['clicked'] == 1 and row.get('label') == 'Reset ball', cg['summary'])
-	check('crawl_gui reports a change and the log line', row.get('changed') is True
-	      and any('ball dropped' in x for x in row.get('log', [])), row)
-	check('crawl_gui restored the snapshot without losses', row.get('restore', {}).get('restored') == 1
-	      and not row['restore'].get('missing') and not row['restore'].get('failed'), row.get('restore'))
-	info('crawl_gui table', cg['text_table'])
-
-	# connect: pointing the server at 127.0.0.1 explicitly still reaches this app.
-	cn = j(S.connect(host='127.0.0.1', port=S.client.port))
-	check('connect to 127.0.0.1 reports the app', cn['reachable'] and cn['local'] and cn['host'] == '127.0.0.1'
-	      and cn['app']['script'].endswith('demo_scene.py'), cn)
-
 	cam = j(S.camera(position=[0, 6, -9], look_at=[0, 1, 0], hold=True))
 	check('camera hold', abs(cam['position'][1] - 6) < 1e-4 and cam['held'], cam)
 	S.camera(release=True)
 
-	pf = j(S.profile(frames=60))
-	top_funcs = [t['function'] for t in pf['top'][:15]]
-	check('profile sees app code', 'update' in top_funcs, (pf['frame_ms'], pf['python_ms_per_frame'], top_funcs[:6]))
 finally:
 	print('QUIT', S.quit_app())
 

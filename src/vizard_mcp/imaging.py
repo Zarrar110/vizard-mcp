@@ -1,9 +1,8 @@
 """Image helpers for the MCP side: downscaling, grids, labels and line charts."""
 
 import io
-import math
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 PALETTE = [(31, 119, 180), (214, 39, 40), (44, 160, 44), (255, 127, 14), (148, 103, 189),
            (140, 86, 75), (227, 119, 194), (23, 190, 207), (188, 189, 34), (127, 127, 127)]
@@ -50,20 +49,6 @@ def _text_box(draw, xy, text, font, fg=(255, 255, 255), bg=(0, 0, 0, 170), ancho
 	return (l - 3, t - 2, r + 3, b + 2)
 
 
-def grid(images, captions, max_size):
-	"""Tile images (same size) into a near-square grid with a caption on each."""
-	n = len(images)
-	cols = math.ceil(math.sqrt(n))
-	rows = math.ceil(n / cols)
-	w, h = images[0].size
-	sheet = Image.new('RGB', (cols * w, rows * h), (30, 30, 30))
-	draw = ImageDraw.Draw(sheet, 'RGBA')
-	font = _font(max(14, h // 22))
-	for i, (im, cap) in enumerate(zip(images, captions)):
-		x, y = (i % cols) * w, (i // cols) * h
-		sheet.paste(im.resize((w, h)), (x, y))
-		_text_box(draw, (x + 8, y + 8), cap, font)
-	return fit(sheet, max_size)
 
 
 def annotate(im, items):
@@ -89,96 +74,7 @@ def annotate(im, items):
 	return im
 
 
-def _nice_ticks(lo, hi, n=5):
-	if hi <= lo:
-		hi = lo + 1.0
-	raw = (hi - lo) / n
-	mag = 10 ** math.floor(math.log10(raw))
-	step = min((s * mag for s in (1, 2, 2.5, 5, 10) if s * mag >= raw), default=raw)
-	ticks = [math.floor(lo / step) * step]
-	while ticks[-1] < hi - 1e-12 * max(1.0, abs(hi)):
-		ticks.append(ticks[-1] + step)
-	return [round(t, 10) for t in ticks]
 
 
-def line_chart(title, x, series, x_label='time (s)', size=(1100, 620)):
-	"""series: list of (label, values). One shared y axis per chart."""
-	W, H = size
-	im = Image.new('RGB', size, (255, 255, 255))
-	d = ImageDraw.Draw(im)
-	f_title, f_axis = _font(22), _font(15)
-	left, right, top, bottom = 90, 30, 60, 70
-	all_y = [v for _, vals in series for v in vals]
-	ylo, yhi = min(all_y), max(all_y)
-	pad = (yhi - ylo) * 0.06 or abs(yhi) * 0.06 or 1.0
-	yticks = _nice_ticks(ylo - pad, yhi + pad)
-	xticks = _nice_ticks(min(x), max(x))
-	x0, x1 = xticks[0], xticks[-1]
-	y0, y1 = yticks[0], yticks[-1]
-
-	def px(xv):
-		return left + (xv - x0) / ((x1 - x0) or 1) * (W - left - right)
-
-	def py(yv):
-		return H - bottom - (yv - y0) / ((y1 - y0) or 1) * (H - top - bottom)
-
-	d.text((left, 18), title, font=f_title, fill=(20, 20, 20))
-	for t in yticks:
-		d.line([left, py(t), W - right, py(t)], fill=(228, 228, 228))
-		d.text((left - 8, py(t)), '%g' % t, font=f_axis, fill=(80, 80, 80), anchor='rm')
-	for t in xticks:
-		d.line([px(t), top, px(t), H - bottom], fill=(240, 240, 240))
-		d.text((px(t), H - bottom + 8), '%g' % t, font=f_axis, fill=(80, 80, 80), anchor='mt')
-	d.rectangle([left, top, W - right, H - bottom], outline=(120, 120, 120))
-	d.text(((left + W - right) / 2, H - 28), x_label, font=f_axis, fill=(60, 60, 60), anchor='mt')
-
-	lx, ly = left + 10, top + 10
-	for k, (label, vals) in enumerate(series):
-		color = PALETTE[k % len(PALETTE)]
-		pts = [(px(a), py(b)) for a, b in zip(x, vals)]
-		if len(pts) > 1:
-			d.line(pts, fill=color, width=2)
-		else:
-			d.ellipse([pts[0][0] - 3, pts[0][1] - 3, pts[0][0] + 3, pts[0][1] + 3], fill=color)
-		i_max = max(range(len(vals)), key=vals.__getitem__)
-		d.ellipse([pts[i_max][0] - 4, pts[i_max][1] - 4, pts[i_max][0] + 4, pts[i_max][1] + 4], outline=color, width=2)
-		tag = '%s  (max %.4g at t=%.3g)' % (label, vals[i_max], x[i_max])
-		bb = d.textbbox((lx + 22, ly), tag, font=f_axis)
-		d.line([lx, ly + 8, lx + 16, ly + 8], fill=color, width=3)
-		d.text((lx + 22, ly), tag, font=f_axis, fill=(30, 30, 30))
-		lx = bb[2] + 24
-		if lx > W - 300:
-			lx, ly = left + 10, ly + 22
-	return im
 
 
-def diff(current, reference, tolerance=8, tile=32):
-	"""Compare two RGB images. A pixel differs when any channel differs by more than
-	`tolerance`. Returns diff_pct, changed pixel count, the bounding box of the changes,
-	the changed tiles and a diff image (None if the sizes differ)."""
-	if current.size != reference.size:
-		return {'image': None, 'size_mismatch': True, 'capture_size': list(current.size),
-		        'reference_size': list(reference.size), 'diff_pct': 100.0, 'changed_pixels': None,
-		        'total_pixels': None, 'bbox': None, 'changed_tiles': None}
-	r, g, b = ImageChops.difference(current, reference).split()
-	worst = ImageChops.lighter(ImageChops.lighter(r, g), b)
-	mask = worst.point(lambda v: 255 if v > tolerance else 0)
-	w, h = current.size
-	changed = mask.histogram()[255]
-	total = w * h
-	bbox = mask.getbbox()
-	# Faded reference with the changed pixels in red, and a box round each tile that changed.
-	img = Image.blend(reference, Image.new('RGB', (w, h), (255, 255, 255)), 0.6)
-	img.paste(Image.new('RGB', (w, h), (255, 0, 0)), mask=mask)
-	draw = ImageDraw.Draw(img)
-	tiles = 0
-	if changed:
-		for ty in range(0, h, tile):
-			for tx in range(0, w, tile):
-				if mask.crop((tx, ty, min(tx + tile, w), min(ty + tile, h))).getbbox():
-					tiles += 1
-					draw.rectangle([tx, ty, min(tx + tile, w) - 1, min(ty + tile, h) - 1], outline=(200, 0, 0))
-		draw.rectangle([bbox[0], bbox[1], bbox[2] - 1, bbox[3] - 1], outline=(255, 0, 255), width=2)
-	return {'image': img, 'size_mismatch': False, 'diff_pct': round(100.0 * changed / total, 4),
-	        'changed_pixels': changed, 'total_pixels': total,
-	        'bbox': list(bbox) if bbox else None, 'changed_tiles': tiles}

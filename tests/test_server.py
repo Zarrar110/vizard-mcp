@@ -13,12 +13,9 @@ from vizard_mcp.client import VizardClient
 
 EXPECTED = {
 	'vizard_status', 'launch_app', 'quit_app', 'reload_module', 'scene_tree', 'find_nodes', 'node_info',
-	'set_node', 'run_code', 'get_log', 'vizconnect_info', 'vizard_api', 'screenshot', 'multi_view',
-	'filmstrip', 'record_video', 'pick', 'project', 'camera', 'send_key', 'click', 'wait', 'wait_until',
-	'watch_start', 'watch_read', 'watch_plot', 'profile', 'call_command', 'watch_export',
-	'screenshot_diff', 'scene_stats', 'gui_list', 'click_button', 'vr_simulate', 'validate',
-	'record_tour', 'doctor', 'snapshot_save', 'snapshot_restore', 'snapshot_list', 'make_report',
-	'connect', 'asset_check', 'crawl_gui'}
+	'set_node', 'run_code', 'get_log', 'vizconnect_info', 'vizard_api', 'screenshot', 'pick', 'project',
+	'camera', 'send_key', 'click', 'wait', 'wait_until', 'call_command', 'scene_stats', 'gui_list',
+	'click_button', 'doctor'}
 
 
 def run(coro):
@@ -31,9 +28,9 @@ def no_app(monkeypatch):
 	monkeypatch.setitem(S._launched, 'proc', None)
 
 
-def test_all_44_tools_register_with_valid_schemas():
+def test_all_25_tools_register_with_valid_schemas():
 	tools = run(S.mcp.list_tools())
-	assert len(tools) == 44
+	assert len(tools) == 25
 	assert {t.name for t in tools} == EXPECTED
 	for t in tools:
 		assert t.description, t.name
@@ -46,11 +43,8 @@ def test_all_44_tools_register_with_valid_schemas():
 def test_required_parameters():
 	req = {t.name: set(t.input_schema.get('required', [])) for t in run(S.mcp.list_tools())}
 	assert req['launch_app'] == {'script'}
-	assert req['watch_start'] == {'expressions'}
 	assert req['pick'] == {'x', 'y'}
 	assert req['vizard_status'] == set()
-	assert req['watch_export'] == {'name', 'path'}
-	assert req['screenshot_diff'] == {'reference'}
 	assert req['scene_stats'] == set()
 
 
@@ -62,7 +56,7 @@ def test_tool_call_without_app_returns_clean_error(no_app):
 def test_vizard_status_without_app(no_app):
 	res = run(S.mcp.call_tool('vizard_status', {}))
 	assert not res.is_error
-	assert json.loads(res.content[0].text) == {'connected': False, 'host': '127.0.0.1', 'port': S.client.port}
+	assert json.loads(res.content[0].text) == {'connected': False, 'port': S.client.port}
 
 
 def test_quit_app_without_app(no_app):

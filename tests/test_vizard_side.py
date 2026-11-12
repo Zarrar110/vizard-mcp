@@ -5,7 +5,6 @@ watch_export, scene_stats on fake nodes, and click coordinate handling. Real-Viz
 for these are in live_test.py.
 """
 
-import csv
 import importlib.util
 import json
 import os
@@ -59,78 +58,8 @@ def vm(monkeypatch):
 	spec = importlib.util.spec_from_file_location('vizmcp_under_test', SRC)
 	mod = importlib.util.module_from_spec(spec)
 	spec.loader.exec_module(mod)
-	mod._State.watches.clear()
 	mod.viz_stub = viz
 	return mod
-
-
-def make_watch(vm, name='w', n=4):
-	vm._State.watches.clear()
-	w = vm._Watch(name, {'a': '1 + 1', 'pos': '(1.0, 2.0, 3.0)'}, 1, 1000, None)
-	for _ in range(n):
-		w.sample()
-		vm.viz_stub.frame += 1
-	vm._State.watches[name] = w
-	return w
-
-
-# --- watch_export -----------------------------------------------------------
-
-def test_export_csv_all_columns(vm, tmp_path):
-	make_watch(vm)
-	res = vm.cmd_watch_export({'name': 'w', 'path': str(tmp_path / 'out' / 'w.csv')})
-	assert res['format'] == 'csv' and res['rows'] == 4
-	assert res['columns'] == ['t', 'frame', 'a', 'pos.x', 'pos.y', 'pos.z']
-	with open(res['path']) as f:
-		rows = list(csv.reader(f))
-	assert rows[0] == res['columns'] and len(rows) == 5
-	assert [float(v) for v in rows[1]][2:] == [2.0, 1.0, 2.0, 3.0]
-	assert [int(r[1]) for r in rows[1:]] == [0, 1, 2, 3]
-
-
-def test_export_column_subset_and_order(vm, tmp_path):
-	make_watch(vm)
-	res = vm.cmd_watch_export({'name': 'w', 'path': str(tmp_path / 'w.csv'), 'columns': ['pos.z', 't']})
-	with open(res['path']) as f:
-		rows = list(csv.reader(f))
-	assert rows[0] == ['pos.z', 't'] and rows[1][0] == '3.0'
-
-
-def test_export_json_with_metadata(vm, tmp_path):
-	make_watch(vm)
-	res = vm.cmd_watch_export({'name': 'w', 'path': str(tmp_path / 'w.json'), 'columns': ['t', 'a']})
-	with open(res['path']) as f:
-		doc = json.load(f)
-	assert res['format'] == 'json'
-	assert doc['watch'] == 'w' and doc['columns'] == ['t', 'a'] and doc['samples'] == 4
-	assert doc['expressions']['a'] == '1 + 1' and doc['rows'][0] == [0.0, 2.0]
-
-
-def test_export_format_argument_overrides_extension(vm, tmp_path):
-	make_watch(vm)
-	res = vm.cmd_watch_export({'name': 'w', 'path': str(tmp_path / 'w.dat'), 'format': 'json'})
-	assert res['format'] == 'json'
-	with open(res['path']) as f:
-		json.load(f)
-
-
-def test_export_errors(vm, tmp_path):
-	make_watch(vm)
-	with pytest.raises(ValueError, match='no watch named'):
-		vm.cmd_watch_export({'name': 'x', 'path': str(tmp_path / 'a.csv')})
-	with pytest.raises(ValueError, match='unknown columns'):
-		vm.cmd_watch_export({'name': 'w', 'path': str(tmp_path / 'a.csv'), 'columns': ['nope']})
-	with pytest.raises(ValueError, match='format must be'):
-		vm.cmd_watch_export({'name': 'w', 'path': str(tmp_path / 'a.xlsx')})
-	with pytest.raises(ValueError, match='path is required'):
-		vm.cmd_watch_export({'name': 'w'})
-	vm._State.watches['empty'] = vm._Watch('empty', {'a': '1'}, 1, 10, None)
-	with pytest.raises(ValueError, match='no samples'):
-		vm.cmd_watch_export({'name': 'empty', 'path': str(tmp_path / 'a.csv')})
-
-
-def test_new_commands_are_registered(vm):
-	assert {'watch_export', 'scene_stats', 'click'} <= set(vm.COMMANDS)
 
 
 # --- scene_stats ------------------------------------------------------------

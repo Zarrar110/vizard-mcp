@@ -11,7 +11,6 @@ import sys
 import pytest
 
 from conftest import FakeVizmcp, free_port
-from fake_tools import make_fake_ffmpeg
 from vizard_mcp import cli, doctor, install
 from vizard_mcp import server as S
 
@@ -159,12 +158,6 @@ def test_bad_port_value_fails(home, monkeypatch):
 	assert doctor.check_port().status == 'FAIL'
 
 
-def test_ffmpeg_warn_then_pass(home, tmp_path, monkeypatch):
-	c = doctor.check_ffmpeg()
-	assert c.status == 'WARN' and 'vizard-mcp[video]' in c.hint
-	monkeypatch.setenv('VIZMCP_FFMPEG', make_fake_ffmpeg(tmp_path))
-	c = doctor.check_ffmpeg()
-	assert c.status == 'PASS' and 'VIZMCP_FFMPEG' in c.detail
 
 
 def test_nothing_registered_warns_for_both_clients(home):
@@ -223,7 +216,7 @@ def test_report_format_and_exit_code(home, tmp_path, monkeypatch):
 	assert code == 1                                                   # no Vizard here: FAIL
 	assert text.startswith('vizard-mcp 1.0.0 doctor')
 	assert '[FAIL] Vizard (winviz.exe): not found' in text and '       fix: ' in text
-	assert '[PASS] Python:' in text and '[WARN] ffmpeg' in text
+	assert '[PASS] Python:' in text
 	assert text.rstrip().splitlines()[-1].endswith('failed') and ' failed' in text
 	install_fake_vizard(tmp_path, monkeypatch)
 	lines.clear()
@@ -255,7 +248,6 @@ def test_doctor_rejects_arguments(home):
 
 
 def test_doctor_tool_returns_the_report(home):
-	from mcp.server.mcpserver.exceptions import ToolError  # noqa: F401
 	res = asyncio.run(S.mcp.call_tool('doctor', {}))
 	assert 'vizard-mcp 1.0.0 doctor' in res.content[0].text and '[PASS] Python' in res.content[0].text
 
